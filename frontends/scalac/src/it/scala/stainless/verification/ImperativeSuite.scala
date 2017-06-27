@@ -11,8 +11,6 @@ class ImperativeSuite extends ComponentTestSuite {
     seq => optFailEarly(true) +: seq
   }
 
-  override protected def optionsString(options: inox.Options): String = ""
-
   val component = VerificationComponent
 
   testAll("imperative/valid") { (report, reporter) =>

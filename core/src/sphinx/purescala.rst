@@ -140,7 +140,7 @@ Stainless supports type parameters for classes and functions.
     case class Cons[T](hd: T, tl: List[T]) extends List[T]
     case object Nil extends List[Nothing]
 
-  Stainless, in fact, restricts type parameters to "simple hierarchies",
+  Stainless in fact restricts type parameters to "simple hierarchies",
   where subclasses define the same type parameters in the same order.
 
 Methods
@@ -455,7 +455,7 @@ Function
   currently quite limited.
 
 
-Symbolic Input-Output Examples
+Symbolic Input-Output examples
 ------------------------------
 
 Sometimes, a complete formal specification is hard to write,

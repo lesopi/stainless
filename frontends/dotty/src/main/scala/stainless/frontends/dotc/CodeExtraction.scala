@@ -13,15 +13,11 @@ import core.Symbols._
 import core.Types._
 import core.Flags._
 import util.Positions._
+
 import stainless.ast.SymbolIdentifier
 import extraction.xlang.{trees => xt}
 
-import scala.collection.mutable.{ Map => MutableMap }
 import scala.language.implicitConversions
-
-/** An exception thrown when non-stainless compatible code is encountered. */
-sealed class ImpureCodeEncounteredException(val pos: inox.utils.Position, msg: String, val ot: Option[tpd.Tree])
-  extends Exception(msg)
 
 class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit val ctx: Context)
   extends ASTExtractors {
@@ -31,7 +27,6 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
   import StructuralExtractors._
 
   lazy val reporter = inoxCtx.reporter
-  implicit val debugSection = DebugSectionExtraction
 
   implicit def dottyPosToInoxPos(p: Position): inox.utils.Position = {
     if (!p.exists) {
@@ -39,35 +34,45 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
     } else if (p.start != p.end) {
       val start = ctx.source.atPos(p.startPos)
       val end   = ctx.source.atPos(p.endPos)
-      inox.utils.RangePosition(start.line + 1, start.column + 1, start.point,
-                               end.line + 1, end.column + 1, end.point,
+      inox.utils.RangePosition(start.line, start.column, start.point,
+                               end.line, end.column, end.point,
                                ctx.source.file.file)
     } else {
       val sp = ctx.source.atPos(p)
-      inox.utils.OffsetPosition(sp.line + 1, sp.column + 1, sp.point,
+      inox.utils.OffsetPosition(sp.line, sp.column, sp.point,
                                 ctx.source.file.file)
     }
   }
 
-  private def annotationsOf(sym: Symbol, ignoreOwner: Boolean = false): Set[xt.Flag] = {
-    getAnnotations(sym, ignoreOwner = ignoreOwner).map {
-      case (name, args) => xt.extractFlag(name, args.map(extractTree(_)(DefContext())))
-    }.toSet
+  private def annotationsOf(sym: Symbol): Set[xt.Flag] = {
+    val actualSymbol = sym // .accessedOrSelf
+    (for {
+      a <- actualSymbol.annotations ++ actualSymbol.owner.annotations
+      name = a.symbol.fullName.toString.replaceAll("\\.package$\\.", ".")
+      if name startsWith "stainless.annotation."
+      shortName = name drop "stainless.annotation.".length
+    } yield {
+      xt.extractFlag(shortName, a.arguments.map(extractTree(_)(DefContext())))
+    }).toSet
   }
 
+  /** An exception thrown when non-stainless compatible code is encountered. */
+  sealed class ImpureCodeEncounteredException(val pos: Position, msg: String, val ot: Option[tpd.Tree])
+    extends Exception(msg)
+
   def outOfSubsetError(pos: Position, msg: String) = {
-    throw new ImpureCodeEncounteredException(dottyPosToInoxPos(pos), msg, None)
+    throw new ImpureCodeEncounteredException(pos, msg, None)
   }
 
   def outOfSubsetError(t: tpd.Tree, msg: String) = {
-    throw new ImpureCodeEncounteredException(dottyPosToInoxPos(t.pos), msg, Some(t))
+    throw new ImpureCodeEncounteredException(t.pos, msg, Some(t))
   }
 
   private case class DefContext(
     tparams: Map[Symbol, xt.TypeParameter] = Map(),
-    vars: Map[Symbol, () => xt.Expr] = Map(),
+    vars: Map[Symbol, () => xt.Variable] = Map(),
     mutableVars: Map[Symbol, () => xt.Variable] = Map(),
-    localFuns: Map[Symbol, (xt.ValDef, Seq[xt.TypeParameterDef])] = Map(),
+    localFuns: Map[Symbol, xt.LocalFunDef] = Map(),
     isExtern: Boolean = false
   ) {
     def union(that: DefContext) = {
@@ -80,11 +85,11 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
 
     def isVariable(s: Symbol) = (vars contains s) || (mutableVars contains s)
 
-    def withNewVars(nvars: Traversable[(Symbol, () => xt.Expr)]) = {
+    def withNewVars(nvars: Traversable[(Symbol, () => xt.Variable)]) = {
       copy(vars = vars ++ nvars)
     }
 
-    def withNewVar(nvar: (Symbol, () => xt.Expr)) = {
+    def withNewVar(nvar: (Symbol, () => xt.Variable)) = {
       copy(vars = vars + nvar)
     }
 
@@ -96,9 +101,19 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
       copy(mutableVars = mutableVars ++ nvars)
     }
 
-    def withLocalFun(sym: Symbol, vd: xt.ValDef, tparams: Seq[xt.TypeParameterDef]) = {
-      copy(localFuns = this.localFuns + (sym -> ((vd, tparams))))
+    def withLocalFun(s: Symbol, lf: xt.LocalFunDef) = {
+      copy(localFuns = this.localFuns + (s -> lf))
     }
+  }
+
+  // used for refined type extraction
+  private var nameToIdentifier = Map[Name, Identifier]()
+  def getIdentifier(name: Name): Identifier = nameToIdentifier.get(name) match {
+    case Some(id) => id
+    case None =>
+      val id = FreshIdentifier(name.toString)
+      nameToIdentifier += name -> id
+      id
   }
 
   // This one never fails, on error, it returns Untyped
@@ -107,7 +122,7 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
       extractType(tpt)
     } catch {
       case e: ImpureCodeEncounteredException =>
-        reporter.debug(e.pos, "[ignored] " + e.getMessage, e)
+        e.printStackTrace()
         xt.Untyped
     }
   }
@@ -132,19 +147,7 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
     }
   }
 
-  def extractRef(t: tpd.RefTree): Identifier = {
-    def rec(t: tpd.Tree): Seq[String] = t match {
-      case Select(t2, name) => rec(t2) :+ name.toString
-      case Ident(name) => Seq(name.toString)
-      case tpd.EmptyTree => Seq.empty
-      case _ => outOfSubsetError(t, "Unexpected selector " + t)
-    }
-
-    val refs = (rec(t.qualifier) :+ t.name.toString).filter(_ != "<empty>")
-    FreshIdentifier(refs.mkString("$"))
-  }
-
-  def extractStatic(stats: List[tpd.Tree]): (
+  private def extractStatic(stats: List[tpd.Tree]): (
     Seq[xt.Import],
     Seq[Identifier],
     Seq[Identifier],
@@ -164,10 +167,7 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
       case tpd.EmptyTree =>
         // ignore
 
-      case t if (
-        (annotationsOf(t.symbol) contains xt.Ignore) ||
-        ((t.symbol is Synthetic) && !(t.symbol is Implicit))
-      ) =>
+      case t if (annotationsOf(t.symbol) contains xt.Ignore) || (t.symbol is Synthetic) =>
         // ignore
 
       case vd @ ValDef(_, _, _) if vd.symbol is Module =>
@@ -178,12 +178,6 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
 
       case i @ Import(_, _) =>
         imports ++= extractImports(i)
-
-      case pd @ PackageDef(ref, stats) =>
-        val (imports, classes, functions, modules, newClasses, newFunctions) = extractStatic(stats)
-        subs :+= xt.ModuleDef(extractRef(ref), imports, classes, functions, modules)
-        allClasses ++= newClasses
-        allFunctions ++= newFunctions
 
       case td @ ExObjectDef() =>
         val (obj, newClasses, newFunctions) = extractObject(td)
@@ -199,24 +193,43 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
 
       // Normal function
       case dd @ ExFunctionDef(fsym, tparams, vparams, tpt, rhs) =>
-        val fd = extractFunction(fsym, tparams, vparams, rhs)(DefContext())
+        val fd = extractFunction(fsym, tparams, vparams, rhs)(DefContext(), dd.pos)
         functions :+= fd.id
         allFunctions :+= fd
 
       // Normal fields
       case t @ ExFieldDef(fsym, _, rhs) =>
-        val fd = extractFunction(fsym, Seq(), Seq(), rhs)(DefContext())
+        val fd = extractFunction(fsym, Seq(), Seq(), rhs)(DefContext(), t.pos)
         functions :+= fd.id
         allFunctions :+= fd
 
-      case t if t.symbol is Synthetic =>
-        // ignore
+      // Lazy fields
+      case t @ ExLazyFieldDef(fsym, _, rhs) =>
+        // TODO: can't be executed!?
+        val fd = extractFunction(fsym, Seq(), Seq(), rhs)(DefContext(), t.pos)
+        functions :+= fd.id
+        allFunctions :+= fd
 
       case other =>
         reporter.warning(other.pos, "Could not extract tree in static container: " + other)
     }
 
     (imports, classes, functions, subs, allClasses, allFunctions)
+  }
+
+  def extractPackage(pd: tpd.PackageDef): (xt.UnitDef, Seq[xt.ClassDef], Seq[xt.FunDef]) = {
+    val (imports, classes, functions, subs, allClasses, allFunctions) = extractStatic(pd.stats)
+    assert(functions.isEmpty, "Packages shouldn't contain functions")
+
+    val unit = xt.UnitDef(
+      symbols.getIdentifier(pd.symbol),
+      imports,
+      classes,
+      subs,
+      false // FIXME see [[frontends.scalac.CodeExtraction]]!
+    ).setPos(pd.pos)
+
+    (unit, allClasses, allFunctions)
   }
 
   private def extractObject(td: tpd.TypeDef): (xt.ModuleDef, Seq[xt.ClassDef], Seq[xt.FunDef]) = {
@@ -239,30 +252,119 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
     val sym = td.symbol
     val id = symbols.getIdentifier(sym)
 
+    val tparamsMap = sym.asClass.typeParams.map { sym =>
+      sym -> xt.TypeParameter.fresh(sym.showName)
+    }
+
+    val parent = sym.info.parents.headOption match {
+      case Some(tpe) if tpe.typeSymbol == defn.ObjectClass => None
+      case Some(tp @ TypeRef(_, _)) => Some(symbols.getIdentifier(tp.symbol))
+      case _ => None
+    }
+
+    // TODO: checks!!
+    /*
+      if seenClasses contains parentSym =>
+        getClassDef(parentSym, sym.pos) match {
+          case acd: AbstractClassDef =>
+            val defCtx = DefContext(tparamsMap.toMap)
+            val newTps = tps.map(extractType(_)(defCtx, sym.pos))
+            val zip = (newTps zip tparamsMap.map(_._2))
+            if (newTps.size != tparamsMap.size) {
+              outOfSubsetError(sym.pos, "Child classes should have the same number of type parameters as their parent")
+              None
+            } else if (zip.exists {
+              case (TypeParameter(_), _) => false
+              case _ => true
+            }) {
+              outOfSubsetError(sym.pos, "Child class type params should have a simple mapping to parent params")
+              None
+            } else if (zip.exists {
+              case (TypeParameter(id), ctp) => id.name != ctp.id.name
+              case _ => false
+            }) {
+              outOfSubsetError(sym.pos, "Child type params should be identical to parent class's (e.g. C[T1,T2] extends P[T1,T2])")
+              None
+            } else {
+              Some(acd.typed -> acd.tparams)
+            }
+
+          case cd =>
+            outOfSubsetError(sym.pos, s"Class $id cannot extend ${cd.id}")
+            None
+        }
+
+      case p =>
+        None
+    }
+    */
+
     val template = td.rhs.asInstanceOf[tpd.Template]
 
-    val extparams = sym.asClass.typeParams.map(extractTypeParam)
-    val tpCtx = DefContext((sym.asClass.typeParams zip extparams).toMap)
-
-    val parents = template.parents.flatMap(p => p.tpe match {
-      case tpe if tpe.typeSymbol == defn.ObjectClass => None
-      case tpe if defn.isProductClass(tpe.classSymbol) => None
-      case tpe => Some(extractType(tpe)(tpCtx, p.pos).asInstanceOf[xt.ClassType])
-    })
+    val tparams = tparamsMap.map(t => xt.TypeParameterDef(t._2))
+    val tpCtx = DefContext((tparamsMap.map(_._1) zip tparams.map(_.tp)).toMap)
 
     val flags = annotationsOf(sym) ++ (if (sym is Abstract) Some(xt.IsAbstract) else None)
 
     val args = template.constr.vparamss.flatten
-    val fieldCtx = DefContext((typeParamSymbols(template.constr.tparams) zip extparams).toMap)
     val fields = args.map { vd =>
-      val tpe = stainlessType(vd.tpt.tpe)(fieldCtx, vd.pos)
-      val vdSym = sym.info.decl(vd.symbol.name).symbol
-      val id = symbols.getIdentifier(vdSym)
-      val flags = annotationsOf(vdSym, ignoreOwner = true)
-      if (vdSym.symbol is Mutable) xt.VarDef(id, tpe, flags).setPos(vd.pos)
-      else xt.ValDef(id, tpe, flags).setPos(vd.pos)
+      val tpe = stainlessType(vd.tpe)(tpCtx, vd.pos)
+      val id = freshId(vd.symbol)
+      val flags = annotationsOf(vd.symbol)
+      if (vd.symbol is Mutable) xt.VarDef(id, tpe, flags).setPos(sym.pos)
+      else xt.ValDef(id, tpe, flags).setPos(sym.pos)
     }
 
+    // TODO: check!!
+    /*
+        // checks whether this type definition could lead to an infinite type
+        def computeChains(tpe: LeonType): Map[TypeParameterDef, Set[LeonClassDef]] = {
+          var seen: Set[LeonClassDef] = Set.empty
+          var chains: Map[TypeParameterDef, Set[LeonClassDef]] = Map.empty
+
+          def rec(tpe: LeonType): Set[LeonClassDef] = tpe match {
+            case ct: ClassType =>
+              val root = ct.classDef.root
+              if (!seen(ct.classDef.root)) {
+                seen += ct.classDef.root
+                for (cct <- ct.root.knownCCDescendants;
+                     (tp, tpe) <- cct.classDef.tparams zip cct.tps) {
+                  val relevant = rec(tpe)
+                  chains += tp -> (chains.getOrElse(tp, Set.empty) ++ relevant)
+                  for (cd <- relevant; vd <- cd.fields) {
+                    rec(vd.getType)
+                  }
+                }
+              }
+              Set(root)
+
+            case Types.NAryType(tpes, _) =>
+              tpes.flatMap(rec).toSet
+          }
+
+          rec(tpe)
+          chains
+        }
+
+        val chains = computeChains(ccd.typed)
+
+        def check(tp: TypeParameterDef, seen: Set[LeonClassDef]): Unit = chains.get(tp) match {
+          case Some(classDefs) =>
+            if ((seen intersect classDefs).nonEmpty) {
+              outOfSubsetError(sym.pos, "Infinite types are not allowed")
+            } else {
+              for (cd <- classDefs; tp <- cd.tparams) check(tp, seen + cd)
+            }
+          case None =>
+        }
+
+        for (tp <- ccd.tparams) check(tp, Set.empty)
+
+      case _ =>
+    }
+    */
+
+    //println(s"Body of $sym")
     val defCtx = tpCtx.withNewVars((args.map(_.symbol) zip fields.map(vd => () => vd.toVariable)).toMap)
 
     var invariants: Seq[xt.Expr] = Seq.empty
@@ -273,10 +375,7 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
       case tpd.EmptyTree =>
         // ignore
 
-      case t if (
-        (annotationsOf(t.symbol) contains xt.Ignore) ||
-        ((t.symbol is Synthetic) && !(t.symbol is Implicit))
-      ) =>
+      case t if (annotationsOf(t.symbol) contains xt.Ignore) || (t.symbol is Synthetic) =>
         // ignore
 
       case vd @ ValDef(_, _, _) if vd.symbol is ParamAccessor =>
@@ -298,17 +397,21 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
 
       // Normal methods
       case dd @ ExFunctionDef(fsym, tparams, vparams, tpt, rhs) =>
-        methods :+= extractFunction(fsym, tparams, vparams, rhs)(defCtx)
+        methods :+= extractFunction(fsym, tparams, vparams, rhs)(defCtx, dd.pos)
 
       // Normal fields
       case t @ ExFieldDef(fsym, _, rhs) =>
-        methods :+= extractFunction(fsym, Seq(), Seq(), rhs)(defCtx)
+        methods :+= extractFunction(fsym, Seq(), Seq(), rhs)(defCtx, t.pos)
 
-      case d if d.symbol is Synthetic =>
-        // ignore
+      // Lazy fields
+      case t @ ExLazyFieldDef(fsym, _, rhs) =>
+        methods :+= extractFunction(fsym, Seq(), Seq(), rhs)(defCtx, t.pos)
+        // TODO: can't be executed!?
 
-      case d if d.symbol is Mutable =>
-        // ignore
+      // Mutable fields
+      case t @ ExMutableFieldDef(fsym, _, rhs) =>
+        // TODO: is this even allowed!?
+        methods :+= extractFunction(fsym, Seq(), Seq(), rhs)(defCtx, t.pos)
 
       case other =>
         reporter.warning(other.pos, "Could not extract tree in class: " + other)
@@ -321,13 +424,14 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
       )
     }
 
-    val allMethods = (methods ++ optInv).map(fd => fd.copy(flags = fd.flags + xt.IsMethodOf(id)))
+    val allMethods = methods ++ optInv
 
     (new xt.ClassDef(
       id,
-      extparams.map(xt.TypeParameterDef(_)),
-      parents,
+      tparams,
+      parent,
       fields,
+      allMethods.map(_.id.asInstanceOf[SymbolIdentifier]),
       flags
     ).setPos(sym.pos), allMethods)
   }
@@ -335,33 +439,33 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
   //trim because sometimes Scala names end with a trailing space, looks nicer without the space
   private def freshId(sym: Symbol): Identifier = FreshIdentifier(sym.name.toString.trim)
 
-  private def extractFunction(
-    sym: Symbol,
-    tdefs: Seq[tpd.TypeDef],
-    vdefs: Seq[tpd.ValDef],
-    rhs: tpd.Tree,
-    typeParams: Option[Seq[xt.TypeParameter]] = None
-  )(implicit dctx: DefContext): xt.FunDef = {
+  private def extractFunction(sym: Symbol, tdefs: Seq[tpd.TypeDef], vdefs: Seq[tpd.ValDef], rhs: tpd.Tree)
+                             (implicit dctx: DefContext, pos: Position): xt.FunDef = {
 
     // Type params of the function itself
-    val extparams = typeParamSymbols(tdefs)
-    val ntparams = typeParams.getOrElse(extparams map extractTypeParam)
+    val tparams = tdefs.flatMap(td => td.tpe match {
+      case tp @ TypeRef(_, _) =>
+        val sym = tp.symbol
+        Some(sym -> xt.TypeParameter.fresh(sym.name.toString))
+      case t =>
+        outOfSubsetError(t.typeSymbol.pos, "Unhandled type for parameter: "+t)
+        None
+    })
 
-    val nctx = dctx.copy(tparams = dctx.tparams ++ (extparams zip ntparams).toMap)
+    val tparamsDef = tparams.map(t => xt.TypeParameterDef(t._2))
 
-    val (newParams, fctx0) = vdefs.foldLeft((Seq.empty[xt.ValDef], nctx)) { case ((params, dctx), param) =>
-      val tpe = stainlessType(param.tpe)(dctx, param.tpt.pos)
-      val ptpe = param.tpt match {
-        case ByNameTypeTree(_) => xt.FunctionType(Seq(), tpe).setPos(param.tpt.pos)
-        case _ => tpe
-      }
+    val nctx = dctx.copy(tparams = dctx.tparams ++ tparams.toMap)
 
-      val flags = annotationsOf(param.symbol, ignoreOwner = true)
-      val vd = xt.ValDef(FreshIdentifier(param.symbol.name.toString), ptpe, flags).setPos(param.pos)
-      val expr = param.tpt match {
-        case ByNameTypeTree(_) => () => xt.Application(vd.toVariable, Seq())
+    val (newParams, fctx) = vdefs.foldLeft((Seq.empty[xt.ValDef], nctx)) { case ((params, dctx), param) =>
+      val vd = xt.ValDef(
+        FreshIdentifier(param.symbol.name.toString).setPos(param.pos),
+        stainlessType(param.tpe)(dctx, param.pos),
+        annotationsOf(param.symbol)
+      ).setPos(param.pos)
+      val expr = () => vd.toVariable /* TODO param match {
+        case ByNameTypeTree(_) => () => xt.Application(vd.toVariable, Seq.empty)
         case _ => () => vd.toVariable
-      }
+      }*/
 
       (params :+ vd, dctx.withNewVar(param.symbol -> expr))
     }
@@ -380,13 +484,26 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
         case _ => outOfSubsetError(rhs, "Wrong form of lazy accessor")
       }
 
-    val fctx = fctx0.copy(isExtern = fctx0.isExtern || (flags contains xt.Extern))
-
     val finalBody = if (rhs == tpd.EmptyTree) {
       flags += xt.IsAbstract
       xt.NoTree(returnType)
-    } else {
+    } else try {
       xt.exprOps.flattenBlocks(extractTreeOrNoTree(body)(fctx))
+    } catch {
+      case e: ImpureCodeEncounteredException =>
+        reporter.error(e.pos, e.getMessage)
+        e.printStackTrace()
+        //val pos = if (body0.pos == NoPosition) NoPosition else leonPosToScalaPos(body0.pos.source, funDef.getPos)
+        /* TODO
+        if (inoxCtx.options.findOptionOrDefault(ExtractionPhase.optStrictCompilation)) {
+          reporter.error(pos, "Function "+id.name+" could not be extracted. The function likely uses features not supported by Leon.")
+        } else {
+          reporter.warning(pos, "Function "+id.name+" is not fully available to Leon.")
+        }
+        */
+
+        flags += xt.IsAbstract
+        xt.NoTree(returnType)
     }
 
     //if (fctx.isExtern && !exists(_.isInstanceOf[NoTree])(finalBody)) {
@@ -403,7 +520,7 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
 
     val fd = new xt.FunDef(
       id,
-      ntparams.map(tp => xt.TypeParameterDef(tp)),
+      tparamsDef,
       newParams,
       returnType,
       fullBody,
@@ -413,23 +530,6 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
 
     fd
   }
-
-  private def typeParamSymbols(tdefs: Seq[tpd.TypeDef]): Seq[Symbol] = tdefs.flatMap(_.tpe match {
-    case tp @ TypeRef(_, _) =>
-      Some(tp.symbol)
-    case t =>
-      outOfSubsetError(t.typeSymbol.pos, "Unhandled type for parameter: "+t)
-      None
-  })
-
-  private val etpCache = MutableMap[Symbol, xt.TypeParameter]()
-  private def extractTypeParam(sym: Symbol): xt.TypeParameter = etpCache.getOrElseUpdate(sym, {
-    val variance =
-      if (sym is Covariant) Some(xt.Variance(true))
-      else if (sym is Contravariant) Some(xt.Variance(false))
-      else None
-    xt.TypeParameter(symbols.getIdentifier(sym), variance.toSet)
-  })
 
   private def extractPattern(p: tpd.Tree, binder: Option[xt.ValDef] = None)(implicit dctx: DefContext): (xt.Pattern, DefContext) = p match {
     case b @ Bind(name, t @ Typed(pat, tpt)) =>
@@ -458,17 +558,9 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
       // case Obj =>
       extractType(s) match {
         case ct: xt.ClassType =>
-          (xt.ClassPattern(binder, ct, Seq()).setPos(p.pos), dctx)
+          (xt.ADTPattern(binder, ct, Seq()).setPos(p.pos), dctx)
         case _ =>
-          outOfSubsetError(s, "Invalid instance pattern: "+s)
-      }
-
-    case id @ Ident(_) if id.symbol is (Case | Module) =>
-      extractType(id) match {
-        case ct: xt.ClassType =>
-          (xt.ClassPattern(binder, ct, Seq()).setPos(p.pos), dctx)
-        case _ => 
-          outOfSubsetError(id, "Invalid instance pattern: "+id)
+          outOfSubsetError(s, "Invalid type "+s.tpe+" for .isInstanceOf")
       }
 
     case a @ Apply(fn, args) =>
@@ -476,7 +568,7 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
         case ct: xt.ClassType =>
           val (subPatterns, subDctx) = args.map(extractPattern(_)).unzip
           val nctx = subDctx.foldLeft(dctx)(_ union _)
-          (xt.ClassPattern(binder, ct, subPatterns).setPos(p.pos), nctx)
+          (xt.ADTPattern(binder, ct, subPatterns).setPos(p.pos), nctx)
 
         case xt.TupleType(argsTpes) =>
           val (subPatterns, subDctx) = args.map(extractPattern(_)).unzip
@@ -487,50 +579,36 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
           outOfSubsetError(a, "Invalid type "+a.tpe+" for .isInstanceOf")
       }
 
-    case UnApply(ExSymbol("stainless", "lang", "package$", "BigInt$", "unapply"), _, Seq(Literal(n))) =>
+    case UnApply(ExSymbol("stainless", "lang", "package", "BigInt", "unapply"), _, Seq(Literal(n))) =>
       val lit = xt.IntegerLiteral(BigInt(n.stringValue))
       (xt.LiteralPattern(binder, lit), dctx)
 
-    case ExInt8Literal(i)    => (xt.LiteralPattern(binder, xt.Int8Literal(i)),    dctx)
-    case ExInt16Literal(i)   => (xt.LiteralPattern(binder, xt.Int16Literal(i)),   dctx)
-    case ExInt32Literal(i)   => (xt.LiteralPattern(binder, xt.Int32Literal(i)),   dctx)
-    case ExInt64Literal(i)   => (xt.LiteralPattern(binder, xt.Int64Literal(i)),   dctx)
+    case ExInt32Literal(i)   => (xt.LiteralPattern(binder, xt.IntLiteral(i)),     dctx)
     case ExBooleanLiteral(b) => (xt.LiteralPattern(binder, xt.BooleanLiteral(b)), dctx)
     case ExUnitLiteral()     => (xt.LiteralPattern(binder, xt.UnitLiteral()),     dctx)
     case ExStringLiteral(s)  => (xt.LiteralPattern(binder, xt.StringLiteral(s)),  dctx)
 
-    case t @ Typed(UnApply(f, _, pats), tp) =>
+    case t @ Typed(UnApply(TypeApply(un, tps), _, pats), tp) =>
+      val sym = un.symbol
+
       val (subPatterns, subDctx) = pats.map(extractPattern(_)).unzip
       val nctx = subDctx.foldLeft(dctx)(_ union _)
 
-      val sym = f.symbol
       if (sym.owner.exists && sym.owner.is(Synthetic) &&
           sym.owner.companionClass.exists && sym.owner.companionClass.is(Case)) {
         val ct = extractType(tp).asInstanceOf[xt.ClassType]
-        (xt.ClassPattern(binder, ct, subPatterns).setPos(p.pos), nctx)
+        (xt.ADTPattern(binder, ct, subPatterns).setPos(p.pos), nctx)
       } else {
         val id = symbols.getIdentifier(sym)
-        val tps = f match { case TypeApply(un, tps) => tps map extractType case _ => Seq.empty }
-        (xt.UnapplyPattern(binder, id, tps, subPatterns).setPos(t.pos), nctx)
+        val tparams = tps.map(extractType)
+        (xt.UnapplyPattern(binder, id, tparams, subPatterns).setPos(t.pos), nctx)
       }
 
-    case UnApply(f, _, pats) =>
+    case UnApply(un, _, pats) =>
+      val sym = un.symbol
       val (subPatterns, subDctx) = pats.map(extractPattern(_)).unzip
       val nctx = subDctx.foldLeft(dctx)(_ union _)
-
-      val sym = f.symbol
-      if (sym.owner.exists && TupleSymbol.unapply(sym.owner.companionClass).isDefined) {
-        (xt.TuplePattern(binder, subPatterns), nctx)
-      } else if (sym.owner.exists && sym.owner.is(Synthetic) &&
-          sym.owner.companionClass.exists && sym.owner.companionClass.is(Case)) {
-        val id = symbols.getIdentifier(sym.owner.symbol.companionClass)
-        val tps = f match { case TypeApply(un, tps) => tps map extractType case _ => Seq.empty }
-        (xt.ClassPattern(binder, xt.ClassType(id, tps).setPos(p.pos), subPatterns).setPos(p.pos), nctx)
-      } else {
-        val id = symbols.getIdentifier(sym)
-        val tps = f match { case TypeApply(un, tps) => tps map extractType case _ => Seq.empty }
-        (xt.UnapplyPattern(binder, id, tps, subPatterns).setPos(p.pos), nctx)
-      }
+      (xt.UnapplyPattern(binder, symbols.getIdentifier(sym), Seq.empty, subPatterns).setPos(p.pos), nctx)
 
     case _ =>
       outOfSubsetError(p, "Unsupported pattern: "+p)
@@ -570,109 +648,59 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
       args.map(extractTree)
   }
 
-  private def extractBlock(es: List[tpd.Tree])(implicit dctx: DefContext): xt.Expr = {
-    val fctx = es.collect {
-      case ExFunctionDef(sym, tparams, vparams, tpt, rhs) => (sym, tparams, vparams)
-    }.foldLeft(dctx) { case (dctx, (sym, tparams, vparams)) =>
-      val extparams = typeParamSymbols(tparams)
-      val ntparams = extparams map extractTypeParam
-      val nctx = dctx.copy(tparams = dctx.tparams ++ (extparams zip ntparams).toMap)
+  private def extractBlock(es: List[tpd.Tree])(implicit dctx: DefContext): xt.Expr = es match {
+    case Nil => xt.UnitLiteral() // FIXME?
 
-      val paramTypes = vparams.map { param =>
-        val ptpe = stainlessType(param.tpe)(nctx, param.pos)
-        param.tpt match {
-          case ByNameTypeTree(_) => xt.FunctionType(Seq(), ptpe)
-          case _ => ptpe
-        }
-      }
-      val returnType = stainlessType(sym.info.finalResultType)(nctx, sym.pos)
-      val name = xt.ValDef(
-        symbols.getIdentifier(sym),
-        xt.FunctionType(paramTypes, returnType).setPos(sym.pos),
-        annotationsOf(sym)
-      ).setPos(sym.pos)
+    case ExAssert(contract, oerr) :: xs =>
+      val const = extractTree(contract)
+      val b     = extractBlock(xs)
+      xt.Assert(const, oerr, b)
 
-      dctx.withLocalFun(sym, name, ntparams.map(tp => xt.TypeParameterDef(tp)))
-    }
+    case ExRequire(contract) :: xs =>
+      val pre = extractTree(contract)
+      val b   = extractBlock(xs).setPos(pre)
+      xt.Require(pre, b)
 
-    val (vds, vctx) = es.collect {
-      case v @ ValDef(name, tpt, _) => (v.symbol, name, tpt)
-    }.foldLeft((Map.empty[Symbol, xt.ValDef], fctx)) { case ((vds, dctx), (sym, name, tpt)) =>
-      if (sym is Mutable) {
-        val vd = xt.VarDef(FreshIdentifier(name.toString), extractType(tpt)(dctx), annotationsOf(sym, ignoreOwner = true)).setPos(sym.pos)
-        (vds + (sym -> vd), dctx.withNewMutableVar(sym, () => vd.toVariable))
+    case (v @ ValDef(name, tpt, _)) :: xs =>
+      val vd = if (!v.symbol.is(Mutable)) {
+        xt.ValDef(FreshIdentifier(name.toString), extractType(tpt), annotationsOf(v.symbol)).setPos(v.pos)
       } else {
-        val vd = xt.ValDef(FreshIdentifier(name.toString), extractType(tpt)(dctx), annotationsOf(sym, ignoreOwner = true)).setPos(sym.pos)
-        (vds + (sym -> vd), dctx.withNewVar(sym, () => vd.toVariable))
+        xt.VarDef(FreshIdentifier(name.toString), extractType(tpt), annotationsOf(v.symbol)).setPos(v.pos)
       }
-    }
 
-    def rec(es: List[tpd.Tree]): xt.Expr = es match {
-      case Nil => xt.UnitLiteral()
-
-      case (e @ ExAssert(contract, oerr)) :: xs =>
-        val const = extractTree(contract)(vctx)
-        val b     = rec(xs)
-        xt.Assert(const, oerr, b).setPos(e.pos)
-
-      case (e @ ExRequire(contract)) :: xs =>
-        val pre = extractTree(contract)(vctx)
-        val b   = rec(xs)
-        xt.Require(pre, b).setPos(e.pos)
-
-      case (e @ ExDecreases(ranks)) :: xs =>
-        val measure = xt.tupleWrap(ranks.map(extractTree(_)(vctx)))
-        val b       = rec(xs)
-        xt.Decreases(measure, b).setPos(e.pos)
-
-      case (d @ ExFunctionDef(sym, tparams, params, ret, b)) :: xs =>
-        val (vd, tdefs) = vctx.localFuns(sym)
-        val fd = extractFunction(sym, tparams, params, b, typeParams = Some(tdefs.map(_.tp)))(vctx)
-        val letRec = xt.LocalFunDef(vd, tdefs, xt.Lambda(fd.params, fd.fullBody).setPos(d.pos))
-
-        rec(xs) match {
-          case xt.LetRec(defs, body) => xt.LetRec(letRec +: defs, body).setPos(d.pos)
-          case other => xt.LetRec(Seq(letRec), other).setPos(d.pos)
-        }
-
-      case (v @ ValDef(name, tpt, _)) :: xs =>
-        if (v.symbol is Mutable) {
-          xt.LetVar(vds(v.symbol), extractTree(v.rhs)(vctx), rec(xs)).setPos(v.pos)
+      val restTree = extractBlock(xs) {
+        if (!v.symbol.is(Mutable)) {
+          dctx.withNewVar(v.symbol -> (() => vd.toVariable))
         } else {
-          xt.Let(vds(v.symbol), extractTree(v.rhs)(vctx), rec(xs)).setPos(v.pos)
+          dctx.withNewMutableVar(v.symbol -> (() => vd.toVariable))
         }
+      }.setPos(vd.getPos)
 
-      case ExWhile(cond, body, rest) =>
-        val wh = xt.While(extractTree(cond), extractBlock(body), None).setPos(es.head.pos)
-        rec(rest) match {
-          case xt.Block(elems, last) => xt.Block(wh +: elems, last).setPos(es.head.pos)
-          case e => xt.Block(Seq(wh), e).setPos(es.head.pos)
-        }
+      xt.Let(vd, extractTree(v.rhs), restTree)
 
-      case x :: Nil =>
-        extractTree(x)(vctx)
+    case (d @ ExFunctionDef(sym, tparams, params, ret, b)) :: xs =>
+      val fd = extractFunction(sym, tparams, params, b)(dctx, d.pos)
+      val letRec = xt.LocalFunDef(
+        xt.ValDef(fd.id, extractType(ret)(dctx, d.pos /*FIXME */), fd.flags),
+        fd.tparams,
+        xt.Lambda(fd.params, fd.fullBody)
+      )
+      extractBlock(xs)(dctx.withLocalFun(sym, letRec)) match {
+        case xt.LetRec(defs, body) =>
+          xt.LetRec(letRec +: defs, body)
+        case other =>
+          xt.LetRec(Seq(letRec), other)
+      }
 
-      case x :: rest =>
-        rec(rest) match {
-          case xt.Block(elems, last) =>
-            xt.Block(extractTree(x)(vctx) +: elems, last).setPos(x.pos)
-          case e =>
-            xt.Block(Seq(extractTree(x)(vctx)), e).setPos(x.pos)
-        }
-    }
+    case x :: Nil =>
+      extractTree(x)
 
-    rec(es)
-  }
-
-  private def extractArgs(sym: Symbol, args: Seq[tpd.Tree])(implicit dctx: DefContext): Seq[xt.Expr] = {
-    (args zip sym.info.paramInfoss.flatten) map {
-      case (arg, ExprType(_)) => xt.Lambda(Seq(), extractTree(arg)).setPos(arg.pos)
-      case (arg, _) => extractTree(arg)
-    }
+    case x :: _ =>
+      outOfSubsetError(x, "Unexpected head of block")
   }
 
   private def extractTree(tr: tpd.Tree)(implicit dctx: DefContext): xt.Expr = (tr match {
-    case Block(Seq(dd @ DefDef(_, _, Seq(vparams), _, _)), ExUnwrapped(Closure(Nil, call, targetTpt))) if call.symbol == dd.symbol =>
+    case Block(Seq(dd @ DefDef(_, _, Seq(vparams), _, _)), Closure(Nil, call, targetTpt)) if call.symbol == dd.symbol =>
       val vds = vparams map (vd => xt.ValDef(
         FreshIdentifier(vd.symbol.name.toString),
         extractType(vd.tpt),
@@ -687,46 +715,40 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
       val b = extractBlock(es :+ e)
       xt.exprOps.flattenBlocks(b)
 
-    case ExIdentity(body) =>
-      extractTree(body)
-
-    case ExAssert(contract, oerr) =>
-      xt.Assert(extractTree(contract), oerr, xt.UnitLiteral().setPos(tr.pos))
-
-    case ExRequire(contract) =>
-      xt.Require(extractTree(contract), xt.UnitLiteral().setPos(tr.pos))
-
-    case ExUnwrapped(tree) if tree ne tr => extractTree(tree)
+    case Apply(
+      ExSymbol("scala", "Predef$", "Ensuring") |
+      ExSymbol("stainless", "lang", "StaticChecks$", "any2Ensuring"), Seq(arg)) => extractTree(arg)
+    case Apply(ExSymbol("stainless", "lang", "package$", "SpecsDecorations"), Seq(arg)) => extractTree(arg)
+    case Apply(ExSymbol("stainless", "lang", "package$", "BooleanDecorations"), Seq(arg)) => extractTree(arg)
+    case Apply(ExSymbol("stainless", "proof", "package$", "boolean2ProofOps"), Seq(arg)) => extractTree(arg)
+    case Apply(ExSymbol("stainless", "lang", "package$", "StringDecorations"), Seq(str)) => extractTree(str)
 
     case ExEnsuring(body, contract) =>
       val post = extractTree(contract)
       val b = extractTreeOrNoTree(body)
+      val tpe = extractType(body)
 
       val closure = post match {
         case l: xt.Lambda => l
         case other =>
-          val tpe = extractType(tr)
           val vd = xt.ValDef(FreshIdentifier("res"), tpe, Set.empty).setPos(post)
-          xt.Lambda(Seq(vd), extractType(contract) match {
-            case xt.BooleanType => post
-            case _ => xt.Application(other, Seq(vd.toVariable)).setPos(post)
-          }).setPos(post)
+          xt.Lambda(Seq(vd), xt.Application(other, Seq(vd.toVariable))).setPos(post)
       }
 
       xt.Ensuring(b, closure)
+
+    case t @ ExHolds(body, proof) =>
+      val vd = xt.ValDef(FreshIdentifier("holds"), xt.BooleanType, Set.empty).setPos(tr.pos)
+      val post = xt.Lambda(Seq(vd),
+        xt.And(Seq(extractTree(proof), vd.toVariable)).setPos(tr.pos)
+      ).setPos(tr.pos)
+      xt.Ensuring(extractTreeOrNoTree(body), post)
 
     // an optional "because" is allowed
     case t @ ExHolds(body, Apply(ExSymbol("stainless", "lang", "package$", "because"), Seq(proof))) =>
       val vd = xt.ValDef(FreshIdentifier("holds"), xt.BooleanType, Set.empty).setPos(tr.pos)
       val post = xt.Lambda(Seq(vd),
         xt.And(Seq(extractTreeOrNoTree(proof), vd.toVariable)).setPos(tr.pos)
-      ).setPos(tr.pos)
-      xt.Ensuring(extractTreeOrNoTree(body), post)
-
-    case t @ ExHolds(body, proof) =>
-      val vd = xt.ValDef(FreshIdentifier("holds"), xt.BooleanType, Set.empty).setPos(tr.pos)
-      val post = xt.Lambda(Seq(vd),
-        xt.And(Seq(extractTree(proof), vd.toVariable)).setPos(tr.pos)
       ).setPos(tr.pos)
       xt.Ensuring(extractTreeOrNoTree(body), post)
 
@@ -751,8 +773,22 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
       ).setPos(tr.pos)
       xt.Ensuring(extractTreeOrNoTree(body), post)
 
-    case ExPre(f) => xt.Pre(extractTree(f))
-    case ExOld(e) => xt.Old(extractTree(e))
+    /* TODO: By example stuff...
+    case t @ ExByExampleExpression(input, output) =>
+      val input_expr  =  extractTreeOrNoTree(input).setPos(input.pos)
+      val output_expr  =  extractTreeOrNoTree(output).setPos(output.pos)
+      Passes(input_expr, output_expr, MatchCase(WildcardPattern(None), Some(BooleanLiteral(false)), NoTree(output_expr.getType))::Nil)
+
+    case t @ ExAskExpression(input, output) =>
+      val input_expr  =  extractTreeOrNoTree(input).setPos(input.pos)
+      val output_expr = extractTreeOrNoTree(output).setPos(output.pos)
+
+      val resId = FreshIdentifier("res", output_expr.getType).setPos(current.pos)
+      val post = Lambda(Seq(xt.ValDef(resId)),
+          Passes(input_expr, Variable(resId), MatchCase(WildcardPattern(None), Some(BooleanLiteral(false)), NoTree(output_expr.getType))::Nil)).setPos(current.pos)
+
+      Ensuring(output_expr, post)
+    */
 
     case t @ Select(
       str @ ExSymbol("stainless", "lang", "package$", "StringDecorations"),
@@ -776,15 +812,30 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
         case _ => outOfSubsetError(t, "Unknown \"bigSubstring\" call: " + t)
       }
 
+
+
+    /* TODO: passes stuff...
+    case ExPasses(in, out, cases) =>
+      val ine = extractTree(in)
+      val oute = extractTree(out)
+      val rc = cases.map(extractMatchCase)
+
+      // @mk: FIXME: this whole sanity checking is very dodgy at best.
+      val ines = unwrapTuple(ine, ine.isInstanceOf[Tuple]) // @mk We untuple all tuples
+      ines foreach {
+        case v @ Variable(_) if currentFunDef.params.map{ _.toVariable } contains v =>
+        case LeonThis(_) =>
+        case other => ctx.reporter.fatalError(other.getPos, "Only i/o variables are allowed in i/o examples")
+      }
+      oute match {
+        case Variable(_) => // FIXME: this is not strict enough, we need the bound variable of enclosing Ensuring
+        case other => ctx.reporter.fatalError(other.getPos, "Only i/o variables are allowed in i/o examples")
+      }
+      passes(ine, oute, rc)
+      */
+
     case Apply(TypeApply(ExSymbol("scala", "Array$", "apply"), Seq(tpt)), args) =>
       xt.FiniteArray(extractSeq(args), extractType(tpt))
-
-    case Apply(Apply(TypeApply(ExSymbol("scala", "Array$", "apply"), Seq(tpt)), args), Seq(_)) =>
-      xt.FiniteArray(extractSeq(args), extractType(tpt))
-
-    case Apply(ExSymbol("scala", "Array$", "apply"), head +: tail) =>
-      val xt.ArrayType(base) = extractType(tr)
-      xt.FiniteArray(extractTree(head) +: extractSeq(tail), base)
 
     case s @ Select(_, _) if s.tpe.typeSymbol is ModuleClass =>
       extractType(s) match {
@@ -812,39 +863,42 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
         case Some(fun) =>
           xt.Assignment(fun().setPos(id.pos), extractTree(rhs))
 
-        case None => id.tpe match {
-          case TermRef(tt: ThisType, _) =>
-            xt.FieldAssignment(
-              xt.This(extractType(tt)(dctx, id.pos).asInstanceOf[xt.ClassType]).setPos(id.pos),
-              symbols.getIdentifier(id.symbol),
-              extractTree(rhs)
-            )
-
-          case _ =>
-            outOfSubsetError(a, "Undeclared variable.")
-        }
+        case None =>
+          outOfSubsetError(a, "Undeclared variable.")
       }
 
-    case Assign(s @ Select(lhs, name), rhs) =>
-      xt.FieldAssignment(extractTree(lhs), symbols.getIdentifier(s.symbol), extractTree(rhs))
+    case ExWhile(cond, body) => xt.While(extractTree(cond),
+      xt.Block(body.map(extractTree), xt.UnitLiteral().setPos(tr.pos)).setPos(tr.pos),
+      None
+    )
 
-    case ExCall(
-      Some(rec),
-      ExSymbol("stainless", "lang", "package$", "WhileDecorations", "invariant"),
-      Seq(),
-      Seq(pred)
-    ) => extractTree(rec) match {
-      case b @ xt.Block(Seq(w @ xt.While(cond, body, None)), e) =>
-        xt.Block(Seq(xt.While(cond, body, Some(extractTree(pred))).copiedFrom(w)), e).copiedFrom(b)
-      case e =>
-        outOfSubsetError(tr, "Unexpected while loop invariant.")
-    }
+    case Apply(Select(
+      Apply(ExSymbol("stainless", "lang", "while2Invariant"), Seq(w @ ExWhile(cond, body))),
+      ExNamed("invariant")
+    ), Seq(pred)) => xt.While(extractTree(cond),
+      xt.Block(body.map(extractTree), xt.UnitLiteral().setPos(w.pos)).setPos(w.pos),
+      Some(extractTree(pred))
+    )
+
+    /* TODO: epsilons
+    case epsi @ ExEpsilonExpression(tpt, varSym, predBody) =>
+      val pstpe = extractType(tpt)
+      val nctx = dctx.withNewVar(varSym -> (() => EpsilonVariable(epsi.pos, pstpe)))
+      val c1 = extractTree(predBody)(nctx)
+      if(containsEpsilon(c1)) {
+        outOfSubsetError(epsi, "Usage of nested epsilon is not allowed")
+      }
+      Epsilon(c1, pstpe)
+    */
+
+    case Apply(Select(lhs @ ExSymbol("scala", "Array"), ExNamed("update")), Seq(index, value)) =>
+      xt.ArrayUpdate(extractTree(lhs), extractTree(index), extractTree(value))
 
     case ExBigIntLiteral(Literal(cnst)) =>
       xt.IntegerLiteral(BigInt(cnst.stringValue))
 
-    case Apply(ExSymbol("scala", "math", "BigInt$", "int2bigInt"), Seq(t)) => extractTree(t) match {
-      case xt.Int32Literal(n) => xt.IntegerLiteral(BigInt(n))
+    case Apply(ExSymbol("math", "BigInt", "int2bigInt"), Seq(t)) => extractTree(t) match {
+      case xt.IntLiteral(n) => xt.IntegerLiteral(BigInt(n))
       case _ => outOfSubsetError(tr, "Conversion from Int to BigInt")
     }
 
@@ -854,10 +908,8 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
       case _ => outOfSubsetError(tr, "Real not built from literals")
     }
 
-    case ExInt8Literal(v)  => xt.Int8Literal(v)
-    case ExInt16Literal(v) => xt.Int16Literal(v)
-    case ExInt32Literal(v) => xt.Int32Literal(v)
-    case ExInt64Literal(v) => xt.Int64Literal(v)
+    case ExInt32Literal(v) =>
+      xt.IntLiteral(v)
 
     case ExBooleanLiteral(v) =>
       xt.BooleanLiteral(v)
@@ -871,10 +923,39 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
     case Typed(e, _) =>
       extractTree(e)
 
-    case Inlined(_, members, body) =>
-      extractBlock(members :+ body)
+    case ex @ ExIdentifier(sym, tpt) =>
+      dctx.vars.get(sym).orElse(dctx.mutableVars.get(sym)) match {
+        case Some(builder) =>
+          builder().setPos(ex.pos)
+        case None =>
+          xt.FunctionInvocation(symbols.getIdentifier(sym), Seq.empty, Seq.empty)
+      }
 
-    case Apply(TypeApply(ExSymbol("stainless", "lang", "package$", "choose"), Seq(tpt)), Seq(pred)) =>
+    case Inlined(call, _, _) => extractTree(call)
+
+    /* TODO: holes
+    case hole @ ExHoleExpression(tpt, exprs) =>
+      Hole(extractType(tpt), exprs.map(extractTree))
+
+    case ops @ ExWithOracleExpression(oracles, body) =>
+      val newOracles = oracles map { case (tpt, sym) =>
+        val aTpe  = extractType(tpt)
+        val oTpe  = oracleType(ops.pos, aTpe)
+        val newID = FreshIdentifier(sym.name.toString, oTpe)
+        newID
+      }
+
+      val newVars = (oracles zip newOracles).map {
+        case ((_, sym), id) =>
+          sym -> (() => Variable(id))
+      }
+
+      val cBody = extractTree(body)(dctx.withNewVars(newVars))
+
+      WithOracle(newOracles, cBody)
+    */
+
+    case Apply(TypeApply(ExSymbol("stainless", "lang", "synthesis", "choose"), Seq(tpt)), Seq(pred)) =>
       extractTree(pred) match {
         case xt.Lambda(Seq(vd), body) => xt.Choose(vd, body)
         case e => extractType(tpt) match {
@@ -885,16 +966,10 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
         }
       }
 
-    case Apply(TypeApply(ExSymbol("stainless", "lang", "package$", "forall"), types), Seq(fun)) =>
+    case Apply(TypeApply(ExSymbol("stainless", "lang", "forall"), types), Seq(fun)) =>
       extractTree(fun) match {
         case xt.Lambda(vds, body) => xt.Forall(vds, body)
-        case pred => extractType(fun) match {
-          case xt.FunctionType(from, to) =>
-            val args = from.map(tpe => xt.ValDef(FreshIdentifier("x", true), tpe).setPos(pred))
-            xt.Forall(args, xt.Application(pred, args.map(_.toVariable)).setPos(pred))
-          case _ =>
-            outOfSubsetError(tr, "Unsupported forall definition: " + tr)
-        }
+        case _ => outOfSubsetError(tr, "Expected forall to take a lambda predicate")
       }
 
     case Apply(TypeApply(
@@ -935,25 +1010,24 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
       case e => (xt.TupleSelect(e, 1).setPos(e), xt.TupleSelect(e, 2).setPos(e))
     }, extractType(tpt))
 
-    case Select(e, nme.UNARY_+) => injectCast(e => e)(e)
+    case Apply(Select(New(tpt), nme.CONSTRUCTOR), args) =>
+      extractType(tpt) match {
+        case ct: xt.ClassType => xt.ClassConstructor(ct, args.map(extractTree))
+        case _ => outOfSubsetError(tr, "Construction of a non-class type")
+      }
+
     case Select(e, nme.UNARY_!) => xt.Not(extractTree(e))
-    case Select(e, nme.UNARY_-) => injectCast(xt.UMinus)(e)
-    case Select(e, nme.UNARY_~) => injectCast(xt.BVNot)(e)
+    case Select(e, nme.UNARY_-) => xt.UMinus(extractTree(e))
+    case Select(e, nme.UNARY_~) => xt.BVNot(extractTree(e))
 
-    case Apply(Select(l, nme.NE), Seq(r)) => xt.Not(((extractTree(l), extractType(l), extractTree(r), extractType(r)) match {
-      case (lit @ xt.BVLiteral(_, _), _, e, xt.IntegerType) => xt.Equals(xt.IntegerLiteral(lit.toBigInt).copiedFrom(lit), e)
-      case (e, xt.IntegerType, lit @ xt.BVLiteral(_, _), _) => xt.Equals(e, xt.IntegerLiteral(lit.toBigInt).copiedFrom(lit))
-      case _ => injectCasts(xt.Equals)(l, r)
-    }).setPos(tr.pos))
+    case Apply(Select(l, nme.NE), Seq(r)) => xt.Not(
+      xt.Equals(extractTree(l), extractTree(r)).setPos(tr.pos)
+    )
 
-    case Apply(Select(l, nme.EQ), Seq(r)) => (extractTree(l), extractType(l), extractTree(r), extractType(r)) match {
-      case (lit @ xt.BVLiteral(_, _), _, e, xt.IntegerType) => xt.Equals(xt.IntegerLiteral(lit.toBigInt).copiedFrom(lit), e)
-      case (e, xt.IntegerType, lit @ xt.BVLiteral(_, _), _) => xt.Equals(e, xt.IntegerLiteral(lit.toBigInt).copiedFrom(lit))
-      case _ => injectCasts(xt.Equals)(l, r)
-    }
+    case Apply(Select(l, nme.EQ), Seq(r)) => xt.Equals(extractTree(l), extractTree(r))
 
     case Apply(Apply(Apply(TypeApply(
-      ExSymbol("scala", "Array$", "fill"),
+      ExSymbol("scala", "Array", "fill"),
       Seq(baseType)
     ), Seq(length)), Seq(dflt)), _) =>
       xt.LargeArray(Map.empty, extractTree(dflt), extractTree(length), extractType(baseType))
@@ -1005,8 +1079,8 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
     case ExStringLiteral(s) => xt.StringLiteral(s)
 
     case Apply(Select(
-      lhs @ ExSymbol("stainless", "lang", "package$", "BooleanDecorations"),
-      ExNamed("==>") | ExNamed("$eq$eq$greater")
+      Apply(ExSymbol("stainless", "lang", "package$", "BooleanDecorations"), Seq(lhs)),
+      ExNamed("$eq$eq$greater")
     ), Seq(rhs)) => xt.Implies(extractTree(lhs), extractTree(rhs))
 
     case Apply(tree, args) if defn.isFunctionType(tree.tpe) =>
@@ -1014,53 +1088,35 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
 
     case NamedArg(name, arg) => extractTree(arg)
 
-    case ExConstructor(tpe, args) => extractType(tpe)(dctx, tr.pos) match {
-      case ct: xt.ClassType => xt.ClassConstructor(ct, args map extractTree)
-      case tt: xt.TupleType => xt.Tuple(args map extractTree)
-      case _ => outOfSubsetError(tr, "Unexpected constructor " + tr)
-    }
-
-    case ex @ ExIdentifier(sym, tpt) if dctx.vars contains sym => dctx.vars(sym)().setPos(ex.pos)
-    case ex @ ExIdentifier(sym, tpt) if dctx.mutableVars contains sym => dctx.mutableVars(sym)().setPos(ex.pos)
-
-    case ExThisCall(tt, sym, tps, args) =>
-      val thiss = xt.This(extractType(tt)(dctx, tr.pos).asInstanceOf[xt.ClassType]).setPos(tr.pos)
-      if (sym is ParamAccessor) {
-        xt.ClassSelector(thiss, symbols.getIdentifier(sym))
-      } else {
-        xt.MethodInvocation(thiss, symbols.getIdentifier(sym), tps map extractType, extractArgs(sym, args))
-      }
-
-    case ExCastCall(expr, from, to) =>
-      // Double check that we are dealing with regular integer types
-      val xt.BVType(size) = extractType(from)(dctx, NoPosition)
-      val newType @ xt.BVType(newSize) = extractType(to)(dctx, NoPosition)
-      if (size > newSize) xt.BVNarrowingCast(extractTree(expr), newType)
-      else                xt.BVWideningCast(extractTree(expr), newType)
-
     case ExCall(rec, sym, tps, args) => rec match {
       case None =>
         dctx.localFuns.get(sym) match {
           case None =>
-            xt.FunctionInvocation(symbols.getIdentifier(sym), tps map extractType, extractArgs(sym, args))
-          case Some((name, tparams)) =>
-            xt.ApplyLetRec(name.toVariable, tparams.map(_.tp), tps map extractType, extractArgs(sym, args))
+            xt.FunctionInvocation(symbols.getIdentifier(sym), tps.map(extractType), args.map(extractTree))
+          case Some(localFun) =>
+            xt.ApplyLetRec(localFun.name.toVariable, localFun.tparams.map(_.tp), args map extractTree)
         }
 
       case Some(lhs) => extractType(lhs) match {
         case ct: xt.ClassType =>
-          if (sym is ParamAccessor) {
-            xt.ClassSelector(extractTree(lhs), symbols.getIdentifier(sym))
-          } else {
-            xt.MethodInvocation(extractTree(lhs), symbols.getIdentifier(sym), tps map extractType, extractArgs(sym, args))
+          if (sym.is(Method) && sym.is(Synthetic) && sym.name.toString == "apply") {
+            xt.ClassConstructor(ct, args map extractTree)
+          } else if (sym.is(Method)) {
+            val id = symbols.getIdentifier(sym)
+            xt.MethodInvocation(extractTree(lhs), id, tps map extractType, args map extractTree)
+          } else args match {
+            case Seq() => xt.ClassSelector(extractTree(lhs), symbols.getIdentifier(sym))
+            case Seq(rhs) => xt.FieldAssignment(extractTree(lhs), symbols.getIdentifier(sym), extractTree(rhs))
+            case _ => outOfSubsetError(tr, "Unexpected call")
           }
 
         case ft: xt.FunctionType =>
           xt.Application(extractTree(lhs), args.map(extractTree))
 
         case tpe => (tpe, sym.name.decode.toString, args) match {
+          // TODO: string converters, concat, and stuff...
           case (xt.StringType, "+", Seq(rhs)) => xt.StringConcat(extractTree(lhs), extractTree(rhs))
-          case (xt.IntegerType | xt.BVType(_) | xt.RealType, "+", Seq(rhs)) => injectCasts(xt.Plus)(lhs, rhs)
+          case (xt.IntegerType | xt.BVType(_) | xt.RealType, "+", Seq(rhs)) => xt.Plus(extractTree(lhs), extractTree(rhs))
 
           case (xt.SetType(_), "+",  Seq(rhs)) => xt.SetAdd(extractTree(lhs), extractTree(rhs))
           case (xt.SetType(_), "++", Seq(rhs)) => xt.SetUnion(extractTree(lhs), extractTree(rhs))
@@ -1068,7 +1124,6 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
           case (xt.SetType(_), "--", Seq(rhs)) => xt.SetDifference(extractTree(lhs), extractTree(rhs))
           case (xt.SetType(_), "subsetOf", Seq(rhs)) => xt.SubsetOf(extractTree(lhs), extractTree(rhs))
           case (xt.SetType(_), "contains", Seq(rhs)) => xt.ElementOfSet(extractTree(rhs), extractTree(lhs))
-          case (xt.SetType(b), "-", Seq(rhs)) => xt.SetDifference(extractTree(lhs), xt.FiniteSet(Seq(extractTree(rhs)), b).setPos(tr.pos))
 
           case (xt.BagType(_), "+",   Seq(rhs)) => xt.BagAdd(extractTree(lhs), extractTree(rhs))
           case (xt.BagType(_), "++",  Seq(rhs)) => xt.BagUnion(extractTree(lhs), extractTree(rhs))
@@ -1079,119 +1134,29 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
           case (xt.ArrayType(_), "apply",   Seq(rhs))          => xt.ArraySelect(extractTree(lhs), extractTree(rhs))
           case (xt.ArrayType(_), "length",  Seq())             => xt.ArrayLength(extractTree(lhs))
           case (xt.ArrayType(_), "updated", Seq(index, value)) => xt.ArrayUpdated(extractTree(lhs), extractTree(index), extractTree(value))
-          case (xt.ArrayType(_), "update",  Seq(index, value)) => xt.ArrayUpdate(extractTree(lhs), extractTree(index), extractTree(value))
           case (xt.ArrayType(_), "clone",   Seq())             => extractTree(lhs)
 
-          case (xt.MapType(_, _), "get", Seq(rhs)) =>
-            xt.MapApply(extractTree(lhs), extractTree(rhs))
+          // TODO: maps ??
 
-          case (xt.MapType(_, xt.ClassType(_, Seq(to))), "apply", Seq(rhs)) =>
-            val (l, r) = (extractTree(lhs), extractTree(rhs))
-            val someTpe = xt.ClassType(symbols.getIdentifier(someSymbol), Seq(to)).setPos(tr.pos)
-            xt.Assert(
-              xt.IsInstanceOf(xt.MapApply(l, r).setPos(tr.pos), someTpe).setPos(tr.pos),
-              Some("Map undefined at this index"),
-              xt.ClassSelector(
-                xt.AsInstanceOf(xt.MapApply(l, r).setPos(tr.pos), someTpe).setPos(tr.pos),
-                symbols.getIdentifier(someSymbol.info.decl(termName("v")).symbol)
-              ).setPos(tr.pos)
-            )
-
-          case (xt.MapType(_, xt.ClassType(_, Seq(to))), "isDefinedAt" | "contains", Seq(rhs)) =>
-            xt.Not(xt.Equals(
-              xt.MapApply(extractTree(lhs), extractTree(rhs)).setPos(tr.pos),
-              xt.ClassConstructor(
-                xt.ClassType(symbols.getIdentifier(noneSymbol).setPos(tr.pos), Seq(to)).setPos(tr.pos),
-                Seq()
-              ).setPos(tr.pos)
-            ).setPos(tr.pos))
-
-          case (xt.MapType(_, xt.ClassType(_, Seq(to))), "updated" | "+", Seq(key, value)) =>
-            xt.MapUpdated(
-              extractTree(lhs), extractTree(key),
-              xt.ClassConstructor(
-                xt.ClassType(symbols.getIdentifier(someSymbol), Seq(to)).setPos(tr.pos),
-                Seq(extractTree(value))
-              ).setPos(tr.pos)
-            )
-
-          case (xt.MapType(from, xt.ClassType(_, Seq(to))), "+", Seq(rhs)) =>
-            val vd = xt.ValDef(FreshIdentifier("x", true), xt.TupleType(Seq(from, to)).setPos(tr.pos)).setPos(tr.pos)
-            xt.Let(vd, extractTree(rhs), xt.MapUpdated(
-              extractTree(lhs), xt.TupleSelect(vd.toVariable, 1).setPos(tr.pos),
-              xt.ClassConstructor(
-                xt.ClassType(symbols.getIdentifier(someSymbol), Seq(to)).setPos(tr.pos),
-                Seq(xt.TupleSelect(vd.toVariable, 2).setPos(tr.pos))
-              ).setPos(tr.pos)
-            ).setPos(tr.pos))
-
-          case (xt.MapType(_, xt.ClassType(_, Seq(to))), "++", Seq(rhs)) =>
-            extractTree(rhs) match {
-              case xt.FiniteMap(pairs, default, keyType, valueType) =>
-                pairs.foldLeft(extractTree(lhs)) { case (map, (k, v)) =>
-                  xt.MapUpdated(map, k, v).setPos(tr.pos)
-                }
-
-              case _ => outOfSubsetError(tr, "Can't extract map union with non-finite map")
-            }
-
-          case (xt.MapType(_, xt.ClassType(_, Seq(to))), "getOrElse", Seq(key, orElse)) =>
-            xt.MethodInvocation(
-              xt.MapApply(extractTree(lhs), extractTree(key)).setPos(tr.pos),
-              symbols.getIdentifier(optionSymbol.info.decl(termName("getOrElse")).symbol),
-              Seq.empty,
-              Seq(xt.Lambda(Seq(), extractTree(orElse)).setPos(tr.pos))
-            )
-
-          case (_, "-",   Seq(rhs)) => injectCasts(xt.Minus)(lhs, rhs)
-          case (_, "*",   Seq(rhs)) => injectCasts(xt.Times)(lhs, rhs)
-          case (_, "%",   Seq(rhs)) => injectCasts(xt.Remainder)(lhs, rhs)
+          case (_, "-",   Seq(rhs)) => xt.Minus(extractTree(lhs), extractTree(rhs))
+          case (_, "*",   Seq(rhs)) => xt.Times(extractTree(lhs), extractTree(rhs))
+          case (_, "%",   Seq(rhs)) => xt.Remainder(extractTree(lhs), extractTree(rhs))
           case (_, "mod", Seq(rhs)) => xt.Modulo(extractTree(lhs), extractTree(rhs))
-          case (_, "/",   Seq(rhs)) => injectCasts(xt.Division)(lhs, rhs)
-          case (_, ">",   Seq(rhs)) => injectCasts(xt.GreaterThan)(lhs, rhs)
-          case (_, ">=",  Seq(rhs)) => injectCasts(xt.GreaterEquals)(lhs, rhs)
-          case (_, "<",   Seq(rhs)) => injectCasts(xt.LessThan)(lhs, rhs)
-          case (_, "<=",  Seq(rhs)) => injectCasts(xt.LessEquals)(lhs, rhs)
+          case (_, "/",   Seq(rhs)) => xt.Division(extractTree(lhs), extractTree(rhs))
+          case (_, ">",   Seq(rhs)) => xt.GreaterThan(extractTree(lhs), extractTree(rhs))
+          case (_, ">=",  Seq(rhs)) => xt.GreaterEquals(extractTree(lhs), extractTree(rhs))
+          case (_, "<",   Seq(rhs)) => xt.LessThan(extractTree(lhs), extractTree(rhs))
+          case (_, "<=",  Seq(rhs)) => xt.LessEquals(extractTree(lhs), extractTree(rhs))
 
-          case (xt.BooleanType, "|",   Seq(rhs)) => xt.BoolBitwiseOr(extractTree(lhs), extractTree(rhs))
-          case (xt.BooleanType, "&",   Seq(rhs)) => xt.BoolBitwiseAnd(extractTree(lhs), extractTree(rhs))
-          case (xt.BooleanType, "^",   Seq(rhs)) => xt.BoolBitwiseXor(extractTree(lhs), extractTree(rhs))
-
-          case (xt.BVType(_), "|",   Seq(rhs)) => injectCasts(xt.BVOr)(lhs, rhs)
-          case (xt.BVType(_), "&",   Seq(rhs)) => injectCasts(xt.BVAnd)(lhs, rhs)
-          case (xt.BVType(_), "^",   Seq(rhs)) => injectCasts(xt.BVXor)(lhs, rhs)
-          case (xt.BVType(_), "<<",  Seq(rhs)) => injectCastsForShift(xt.BVShiftLeft)(lhs, rhs)
-          case (xt.BVType(_), ">>",  Seq(rhs)) => injectCastsForShift(xt.BVAShiftRight)(lhs, rhs)
-          case (xt.BVType(_), ">>>", Seq(rhs)) => injectCastsForShift(xt.BVLShiftRight)(lhs, rhs)
+          case (_, "|",   Seq(rhs)) => xt.BVOr(extractTree(lhs), extractTree(rhs))
+          case (_, "&",   Seq(rhs)) => xt.BVAnd(extractTree(lhs), extractTree(rhs))
+          case (_, "^",   Seq(rhs)) => xt.BVXor(extractTree(lhs), extractTree(rhs))
+          case (_, "<<",  Seq(rhs)) => xt.BVShiftLeft(extractTree(lhs), extractTree(rhs))
+          case (_, ">>",  Seq(rhs)) => xt.BVAShiftRight(extractTree(lhs), extractTree(rhs))
+          case (_, ">>>", Seq(rhs)) => xt.BVLShiftRight(extractTree(lhs), extractTree(rhs))
 
           case (_, "&&",  Seq(rhs)) => xt.And(extractTree(lhs), extractTree(rhs))
           case (_, "||",  Seq(rhs)) => xt.Or(extractTree(lhs), extractTree(rhs))
-
-          case (tpe, "toByte", Seq()) => tpe match {
-            case xt.BVType(8) => extractTree(lhs)
-            case xt.BVType(16 | 32 | 64) => xt.BVNarrowingCast(extractTree(lhs), xt.BVType(8))
-            case tpe => outOfSubsetError(tr, s"Unexpected cast .toByte from $tpe")
-          }
-
-          case (tpe, "toShort", Seq()) => tpe match {
-            case xt.BVType(8) => xt.BVWideningCast(extractTree(lhs), xt.BVType(16))
-            case xt.BVType(16) => extractTree(lhs)
-            case xt.BVType(32 | 64) => xt.BVNarrowingCast(extractTree(lhs), xt.BVType(16))
-            case tpe => outOfSubsetError(tr, s"Unexpected cast .toShort from $tpe")
-          }
-
-          case (tpe, "toInt", Seq()) => tpe match {
-            case xt.BVType(8 | 16) => xt.BVWideningCast(extractTree(lhs), xt.BVType(32))
-            case xt.BVType(32) => extractTree(lhs)
-            case xt.BVType(64) => xt.BVNarrowingCast(extractTree(lhs), xt.BVType(32))
-            case tpe => outOfSubsetError(tr, s"Unexpected cast .toInt from $tpe")
-          }
-
-          case (tpe, "toLong", Seq()) => tpe match {
-            case xt.BVType(8 | 16 | 32 ) => xt.BVWideningCast(extractTree(lhs), xt.BVType(64))
-            case xt.BVType(64) => extractTree(lhs)
-            case tpe => outOfSubsetError(tr, s"Unexpected cast .toLong from $tpe")
-          }
 
           case (tpe, name, args) =>
             outOfSubsetError(tr, "Unknown call to " + name +
@@ -1204,99 +1169,13 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
     case _ => outOfSubsetError(tr, "Could not extract tree " + tr + " ("+tr.getClass+")")
   }).setPos(tr.pos)
 
-
-  /** Inject implicit widening casts according to the Java semantics (5.6.2. Binary Numeric Promotion) */
-  private def injectCasts(ctor: (xt.Expr, xt.Expr) => xt.Expr)
-                         (lhs0: tpd.Tree, rhs0: tpd.Tree)
-                         (implicit dctx: DefContext): xt.Expr = {
-    injectCastsImpl(ctor)(lhs0, rhs0, false)
-  }
-
-  /**
-   *  Inject casts, special edition for shift operations.
-   *
-   *  NOTE In THEORY, the rhs needs to be promoted independently of lhs.
-   *       In PRACTICE, Inox requires that both operands have the same type.
-   *       [[CodeGeneration]] is applying a narrowing cast from Long to Int
-   *       if needed. Here we add the opposite, and safe operation when lhs
-   *       is a Long. We do not support shift operations when rhs is Long
-   *       but lhs is a smaller BVType.
-   */
-  private def injectCastsForShift(ctor: (xt.Expr, xt.Expr) => xt.Expr)
-                                 (lhs0: tpd.Tree, rhs0: tpd.Tree)
-                                 (implicit dctx: DefContext): xt.Expr = {
-    injectCastsImpl(ctor)(lhs0, rhs0, true)
-  }
-
-  private def injectCastsImpl(ctor: (xt.Expr, xt.Expr) => xt.Expr)
-                             (lhs0: tpd.Tree, rhs0: tpd.Tree, shift: Boolean)
-                             (implicit dctx: DefContext): xt.Expr = {
-    def checkBits(tr: tpd.Tree, tpe: xt.Type) = tpe match {
-      case xt.BVType(8 | 16 | 32 | 64) => // Byte, Short, Int or Long are ok
-      case xt.BVType(s) => outOfSubsetError(tr, s"Unexpected integer of $s bits")
-      case _ => // non-bitvector types are ok too
-    }
-
-    val lhs = extractTree(lhs0)
-    val rhs = extractTree(rhs0)
-
-    val ltpe = extractType(lhs0)
-    checkBits(lhs0, ltpe)
-    val rtpe = extractType(rhs0)
-    checkBits(rhs0, rtpe)
-
-    def id = { e: xt.Expr => e }
-    def widen32 = { e: xt.Expr => xt.BVWideningCast(e, xt.BVType(32)) }
-    def widen64 = { e: xt.Expr => xt.BVWideningCast(e, xt.BVType(64)) }
-
-    val (lctor, rctor) = (ltpe, rtpe) match {
-      case (xt.BVType(64), xt.BVType(64))          => (id, id)
-      case (xt.BVType(64), xt.BVType(_))           => (id, widen64)
-      case (xt.BVType(_),  xt.BVType(64)) if shift => outOfSubsetError(rhs0, s"Unsupported shift")
-      case (xt.BVType(_),  xt.BVType(64))          => (widen64, id)
-      case (xt.BVType(32), xt.BVType(32))          => (id, id)
-      case (xt.BVType(32), xt.BVType(_))           => (id, widen32)
-      case (xt.BVType(_),  xt.BVType(32))          => (widen32, id)
-      case (xt.BVType(_),  xt.BVType(_))           => (widen32, widen32)
-
-      case (xt.BVType(_), _) | (_, xt.BVType(_)) =>
-        outOfSubsetError(lhs0, s"Unexpected combination of types: $ltpe and $rtpe")
-
-      case (_, _) => (id, id)
-    }
-
-    ctor(lctor(lhs), rctor(rhs))
-  }
-
-  /** Inject implicit widening cast according to the Java semantics (5.6.1. Unary Numeric Promotion) */
-  private def injectCast(ctor: xt.Expr => xt.Expr)(e0: tpd.Tree)(implicit dctx: DefContext): xt.Expr = {
-    val e = extractTree(e0)
-    val etpe = extractType(e0)
-
-    val id = { e: xt.Expr => e }
-    val widen32 = { e: xt.Expr => xt.BVWideningCast(e, xt.Int32Type) }
-
-    val ector = etpe match {
-      case xt.BVType(8 | 16) => widen32
-      case xt.BVType(32 | 64) => id
-      case xt.BVType(s) => outOfSubsetError(e0, s"Unexpected integer type of $s bits")
-      case _ => id
-    }
-
-    ctor(ector(e))
-  }
-
   private def extractType(t: tpd.Tree)(implicit dctx: DefContext): xt.Type = {
     extractType(t.tpe)(dctx, t.pos)
   }
 
-  private val etCache = MutableMap[Type, xt.Type]()
-  private def extractType(tpt: Type)(implicit dctx: DefContext, pos: Position): xt.Type = etCache.getOrElseUpdate(tpt, (tpt match {
+  private def extractType(tpt: Type)(implicit dctx: DefContext, pos: Position): xt.Type = tpt match {
     case tpe if tpe.typeSymbol == defn.CharClass    => xt.CharType
-    case tpe if tpe.typeSymbol == defn.ByteClass    => xt.Int8Type
-    case tpe if tpe.typeSymbol == defn.ShortClass   => xt.Int16Type
     case tpe if tpe.typeSymbol == defn.IntClass     => xt.Int32Type
-    case tpe if tpe.typeSymbol == defn.LongClass    => xt.Int64Type
     case tpe if tpe.typeSymbol == defn.BooleanClass => xt.BooleanType
     case tpe if tpe.typeSymbol == defn.UnitClass    => xt.UnitType
 
@@ -1306,69 +1185,65 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
 
     case ct: ConstantType => extractType(ct.value.tpe)
 
-    case tr: TypeRef if dctx.tparams.isDefinedAt(tr.symbol) => dctx.tparams(tr.symbol)
+    case tt @ TypeRef(_, _) if dctx.tparams.isDefinedAt(tt.symbol) =>
+      dctx.tparams(tt.symbol)
 
-    case tt @ TypeRef(_, _) if tt != tt.dealias =>
-      extractType(tt.dealias)
-
-    case tt @ TypeRef(prefix: TermRef, name) if prefix.underlying.classSymbol.typeParams.exists(_.name == name) =>
-      extractType(TypeRef(prefix.widenTermRefExpr, name))
-
-    case tt @ TypeRef(prefix, name) if prefix.classSymbol.typeParams.exists(_.name == name) =>
-      val idx = prefix.classSymbol.typeParams.indexWhere(_.name == name)
-      (extractType(prefix), idx) match {
-        case (xt.MapType(from, ct @ xt.ClassType(id, Seq(to))), 1) => to
-        case (tp @ xt.typeOps.Deconstructor(tps, _), _) => tps(idx)
-      }
-
-    case tr: TypeRef if isScalaSetSym(tr.symbol) =>
+    /*
+    case TypeRef(_, sym, btt :: Nil) if isScalaSetSym(sym) =>
       outOfSubsetError(pos, "Scala's Set API is no longer extracted. Make sure you import leon.lang.Set that defines supported Set operations.")
-    case tr: TypeRef if isScalaMapSym(tr.symbol) =>
+
+    case TypeRef(_, sym, List(a,b)) if isScalaMapSym(sym) =>
       outOfSubsetError(pos, "Scala's Map API is no longer extracted. Make sure you import leon.lang.Map that defines supported Map operations.")
 
-    case tr: TypeRef if isSetSym(tr.symbol) =>
-      val Seq(tp) = tr.classSymbol.typeParams.map(extractTypeParam)
-      xt.SetType(tp)
+    case TypeRef(_, sym, btt :: Nil) if isSetSym(sym) =>
+      xt.SetType(extractType(btt))
 
-    case tr: TypeRef if isBagSym(tr.symbol) =>
-      val Seq(tp) = tr.classSymbol.typeParams.map(extractTypeParam)
-      xt.BagType(tp)
+    case TypeRef(_, sym, btt :: Nil) if isBagSym(sym) =>
+      xt.BagType(extractType(btt))
 
-    case tr: TypeRef if isMapSym(tr.symbol) =>
-      val Seq(from, to) = tr.classSymbol.typeParams.map(extractTypeParam)
-      xt.MapType(from, xt.ClassType(symbols.getIdentifier(optionSymbol), Seq(to)).setPos(pos))
+    case TypeRef(_, sym, List(ftt,ttt)) if isMapSym(sym) =>
+      xt.MapType(extractType(ftt), extractType(ttt))
 
-    case tr: TypeRef if TupleSymbol.unapply(tr.classSymbol).isDefined =>
-      xt.TupleType(tr.classSymbol.typeParams.map(extractTypeParam))
+    case TypeRef(_, sym, List(t1,t2)) if isTuple2(sym) =>
+      xt.TupleType(Seq(extractType(t1),extractType(t2)))
 
-    case tr: TypeRef if isArrayClassSym(tr.symbol) =>
-      val Seq(tp) = tr.classSymbol.typeParams.map(extractTypeParam)
-      xt.ArrayType(tp)
+    case TypeRef(_, sym, List(t1,t2,t3)) if isTuple3(sym) =>
+      xt.TupleType(Seq(extractType(t1),extractType(t2),extractType(t3)))
 
-    case _ if defn.isFunctionClass(tpt.typeSymbol) && tpt.dealias.argInfos.isEmpty =>
-      xt.FunctionType(Seq(), xt.UnitType)
+    case TypeRef(_, sym, List(t1,t2,t3,t4)) if isTuple4(sym) =>
+      xt.TupleType(Seq(extractType(t1),extractType(t2),extractType(t3),extractType(t4)))
 
-    case defn.FunctionOf(from, to, _) =>
+    case TypeRef(_, sym, List(t1,t2,t3,t4,t5)) if isTuple5(sym) =>
+      xt.TupleType(Seq(extractType(t1),extractType(t2),extractType(t3),extractType(t4),extractType(t5)))
+
+    case TypeRef(_, sym, btt :: Nil) if isArrayClassSym(sym) =>
+      xt.ArrayType(extractType(btt))
+    */
+
+    case defn.FunctionOf(from, to) =>
       xt.FunctionType(from map extractType, extractType(to))
 
     case tt @ ThisType(tr) =>
       extractType(tr)
 
+    case tt @ TypeRef(_, _) if tt != tt.dealias =>
+      extractType(tt.dealias)
+
     case RefinedType(p, name, tpe) =>
-      val bt = extractType(p)
-      val idx = p.classSymbol.typeParams.indexWhere(_.name == name)
-      (extractType(p), idx) match {
-        case (xt.MapType(from, ct @ xt.ClassType(id, Seq(to))), 1) =>
-          xt.MapType(from, xt.ClassType(id, Seq(extractType(tpe))).copiedFrom(ct))
-        case (xt.typeOps.Deconstructor(tps, recons), _) =>
-          recons(tps.updated(idx, extractType(tpe)))
-      }
+      val ct @ xt.ClassType(id, tps) = extractType(p)
+      val substMap = Map(getIdentifier(name) -> extractType(tpe))
+      xt.ClassType(id, tps.map {
+        case tp @ xt.TypeParameter(id, _) => substMap.getOrElse(id, tp)
+        case tpe => tpe
+      }).copiedFrom(ct)
 
     case tt @ TypeRef(_, _) if tt.classSymbol.exists =>
-      val sym = tt.classSymbol
-      xt.ClassType(symbols.getIdentifier(sym), sym.typeParams.map {
-        sym => xt.TypeParameter(symbols.getIdentifier(sym), Set.empty)
-      })
+      xt.ClassType(symbols.getIdentifier(tt.symbol),
+        tt.typeParams.map(info => xt.TypeParameter(getIdentifier(info.paramName), Set.empty)))
+
+    case tt @ TypeRef(prefix, name) if prefix.classSymbol.typeParams.exists(_.name == name) =>
+      val idx = prefix.classSymbol.typeParams.map(_.name).indexOf(name)
+      extractType(prefix).asInstanceOf[xt.ClassType].tps(idx)
 
     case tt @ TermRef(_, _) => extractType(tt.widenTermRefExpr)
 
@@ -1378,9 +1253,9 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
 
     case AndType(tp, prod) if prod.typeSymbol == defn.ProductClass => extractType(tp)
     case AndType(prod, tp) if prod.typeSymbol == defn.ProductClass => extractType(tp)
-    case ot: OrType => extractType(ot.join)
+    case ot: OrType => extractType(ot.approximateUnion)
 
-    case pp @ TypeParamRef(binder, num) =>
+    case pp @ PolyParam(binder, num) =>
       dctx.tparams.collectFirst { case (k, v) if k.name == pp.paramName => v }.getOrElse {
         outOfSubsetError(tpt.typeSymbol.pos, "Could not extract "+tpt+" with context " + dctx.tparams)
       }
@@ -1390,7 +1265,7 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
     case AnnotatedType(tpe, _) => extractType(tpe)
 
     // @nv: we want this case to be close to the end as it otherwise interferes with other cases
-    case tpe if tpe.typeSymbol == defn.NothingClass => xt.NothingType
+    case tpe if tpe.typeSymbol == defn.NothingClass => xt.Untyped
 
     case _ =>
       if (tpt ne null) {
@@ -1398,5 +1273,5 @@ class CodeExtraction(inoxCtx: inox.Context, symbols: SymbolsContext)(implicit va
       } else {
         outOfSubsetError(NoPosition, "Tree with null-pointer as type found")
       }
-  }).setPos(pos))
+  }
 }

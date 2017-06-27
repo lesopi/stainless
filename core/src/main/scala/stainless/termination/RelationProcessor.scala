@@ -18,8 +18,6 @@ trait RelationProcessor extends OrderingProcessor {
   import program.symbols._
 
   def run(problem: Problem): Option[Seq[Result]] = {
-    val timer = program.ctx.timers.termination.processors.relation.start()
-
     strengthenPostconditions(problem.funSet)
     strengthenApplications(problem.funSet)
 
@@ -39,13 +37,11 @@ trait RelationProcessor extends OrderingProcessor {
     case class Dep(deps: Set[FunDef]) extends Result
     case object Failure extends Result
 
-    val api = getAPI
-
     reporter.debug("- Searching for size decrease")
     val decreasing = formulas.map({ case (fd, formulas) =>
       val solved = formulas.map({ case (fid, (gt, ge)) =>
-        if (api.solveVALID(gt).contains(true)) Success
-        else if (api.solveVALID(ge).contains(true)) Dep(Set(fid))
+        if (solveVALID(gt).contains(true)) Success
+        else if (solveVALID(ge).contains(true)) Dep(Set(fid))
         else Failure
       })
 
@@ -82,13 +78,9 @@ trait RelationProcessor extends OrderingProcessor {
 
     assert(terminating ++ nonTerminating == problem.funSet)
 
-    val res = if (nonTerminating.isEmpty) {
+    if (nonTerminating.isEmpty)
       Some(terminating.map(Cleared).toSeq)
-    } else {
+    else
       None
-    }
-
-    timer.stop()
-    res
   }
 }

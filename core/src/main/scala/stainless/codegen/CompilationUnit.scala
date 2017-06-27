@@ -124,11 +124,8 @@ trait CompilationUnit extends CodeGeneration {
     * reflection needs this anyway.
     */
   def valueToJVM(e: Expr)(implicit monitor: Monitor): AnyRef = e match {
-    case Int8Literal(v)  => new java.lang.Byte(v)
-    case Int16Literal(v) => new java.lang.Short(v)
-    case Int32Literal(v) => new java.lang.Integer(v)
-    case Int64Literal(v) => new java.lang.Long(v)
-    case bi @ BVLiteral(_, size) => println(s"NOT IMPLEMENTED!!!"); ???
+    case IntLiteral(v) =>
+      new java.lang.Integer(v)
 
     case BooleanLiteral(v) =>
       new java.lang.Boolean(v)
@@ -219,14 +216,8 @@ trait CompilationUnit extends CodeGeneration {
         }
 
         underlying match {
-          case Int8Type =>
-            allocArray { case Int8Literal(v) => v }
-          case Int16Type =>
-            allocArray { case Int16Literal(v) => v }
           case Int32Type =>
-            allocArray { case Int32Literal(v) => v }
-          case Int64Type =>
-            allocArray { case Int64Literal(v) => v }
+            allocArray { case IntLiteral(v) => v }
           case BooleanType =>
             allocArray { case BooleanLiteral(b) => b }
           case UnitType =>
@@ -244,7 +235,7 @@ trait CompilationUnit extends CodeGeneration {
         arr
       }
 
-    case a @ LargeArray(elems, default, Int32Literal(size), base) =>
+    case a @ LargeArray(elems, default, IntLiteral(size), base) =>
       import scala.reflect.ClassTag
 
       if (smallArrays) {
@@ -258,14 +249,8 @@ trait CompilationUnit extends CodeGeneration {
 
         val ArrayType(underlying) = a.getType
         underlying match {
-          case Int8Type =>
-            allocArray { case Int8Literal(v) => v }
-          case Int16Type =>
-            allocArray { case Int16Literal(v) => v }
           case Int32Type =>
-            allocArray { case Int32Literal(v) => v }
-          case Int64Type =>
-            allocArray { case Int64Literal(v) => v }
+            allocArray { case IntLiteral(v) => v }
           case BooleanType =>
             allocArray { case BooleanLiteral(b) => b }
           case UnitType =>
@@ -289,11 +274,8 @@ trait CompilationUnit extends CodeGeneration {
 
   /** Translates JVM objects back to Stainless values of the appropriate type */
   def jvmToValue(e: AnyRef, tpe: Type): Expr = (e, tpe) match {
-    case (b: java.lang.Byte,    Int8Type)  => Int8Literal(b.toByte)
-    case (s: java.lang.Short,   Int16Type) => Int16Literal(s.toShort)
-    case (i: java.lang.Integer, Int32Type) => Int32Literal(i.toInt)
-    case (l: java.lang.Long,    Int64Type) => Int64Literal(l.toLong)
-    case (bv: runtime.BitVector, BVType(size)) => BVLiteral(BigInt(bv.toString, 2), size)
+    case (i: Integer, Int32Type) =>
+      IntLiteral(i.toInt)
 
     case (c: runtime.BigInt, IntegerType) =>
       IntegerLiteral(c.toScala)
@@ -403,7 +385,7 @@ trait CompilationUnit extends CodeGeneration {
         FiniteArray(elems.map(_._2), base)
       } else {
         val default = jvmToValue(ar.default, base)
-        LargeArray(elems.toMap, default, Int32Literal(ar.size), base)
+        LargeArray(elems.toMap, default, IntLiteral(ar.size), base)
       }
 
     case _ =>
@@ -453,10 +435,8 @@ trait CompilationUnit extends CodeGeneration {
     mkExpr(e, ch)(NoLocals.withVars(newMapping))
 
     e.getType match {
-      case JvmIType() =>
+      case ValueType() =>
         ch << IRETURN
-      case Int64Type =>
-        ch << LRETURN
       case _ =>
         ch << ARETURN
     }

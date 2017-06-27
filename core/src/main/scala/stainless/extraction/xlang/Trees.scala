@@ -37,21 +37,6 @@ trait Trees extends oo.Trees { self =>
       functions
   }
 
-  override def getDeconstructor(that: inox.ast.Trees) = that match {
-    case tree: Trees => new TreeDeconstructor {
-      protected val s: self.type = self
-      protected val t: tree.type = tree
-    }.asInstanceOf[TreeDeconstructor { val s: self.type; val t: that.type }]
-
-    case _ => super.getDeconstructor(that)
-  }
-}
-
-
-trait Printer extends oo.Printer {
-  val trees: Trees
-  import trees._
-
   protected def classes(cls: Seq[Identifier]): PrintWrapper = {
     implicit pctx: PrinterContext =>
       withSymbols(cls.map(id => pctx.opts.symbols.flatMap(_.lookupClass(id)) match {
@@ -95,10 +80,33 @@ trait Printer extends oo.Printer {
                                 |"""
       p"|}"
 
+    case cd: ClassDef =>
+      p"class ${cd.id}"
+      p"${nary(cd.tparams, ", ", "[", "]")}"
+      if (cd.fields.nonEmpty) p"(${cd.fields})"
+
+      cd.parent.foreach { id =>
+        p" extends $id${nary(cd.tparams, ", ", "[", "]")}"
+      }
+
+      if (cd.methods.nonEmpty) {
+        p""" {
+            |  ${functions(cd.methods)}
+            |}"""
+      }
+
     case _ => super.ppBody(tree)
   }
-}
 
+  override def getDeconstructor(that: inox.ast.Trees) = that match {
+    case tree: Trees => new TreeDeconstructor {
+      protected val s: self.type = self
+      protected val t: tree.type = tree
+    }.asInstanceOf[TreeDeconstructor { val s: self.type; val t: that.type }]
+
+    case _ => super.getDeconstructor(that)
+  }
+}
 
 trait TreeDeconstructor extends oo.TreeDeconstructor {
 

@@ -3,25 +3,12 @@
 package stainless
 package verification
 
+import solvers._
 import inox.utils.ASCIIHelpers._
-import stainless.utils.JsonConvertions._
-import stainless.verification.VCStatus.Invalid
-
-import org.json4s.JsonDSL._
-import org.json4s.JsonAST.{ JArray, JObject, JValue }
-
-import scala.language.existentials
 
 object VerificationComponent extends SimpleComponent {
   val name = "verification"
   val description = "Verification of function contracts"
-
-  /**
-   * Strict Arithmetic Mode:
-   *
-   * Add assertions for integer overflow checking and other unexpected behaviour (e.g. x << 65).
-   */
-  val optStrictArithmetic = inox.FlagOptionDef("strictarithmetic", false)
 
   val trees: stainless.trees.type = stainless.trees
 
@@ -75,25 +62,6 @@ object VerificationComponent extends SimpleComponent {
         ctx.reporter.info("No verification conditions were analyzed.")
       }
     }
-
-    def emitJson(): JValue = {
-      def status2Json(status: VCStatus[Model]): JObject = status match {
-        case Invalid(cex) =>
-          val info = cex.vars map { case (vd, e) => (vd.id.name -> e.toString) }
-          ("status" -> status.name) ~ ("counterexample" -> info)
-
-        case status => ("status" -> status.name)
-      }
-
-      val report: JArray = for { (vc, vr) <- vrs } yield {
-        ("fd" -> vc.fd.name) ~
-        ("pos" -> vc.getPos.toJson) ~
-        ("kind" -> vc.kind.name) ~
-        status2Json(vr.status)
-      }
-
-      report
-    }
   }
 
   def check(funs: Seq[Identifier], p: StainlessProgram): Map[VC[p.trees.type], VCResult[p.Model]] = {
@@ -108,8 +76,8 @@ object VerificationComponent extends SimpleComponent {
 
     for (id <- toVerify) {
       if (getFunction(id).flags contains "library") {
-        val fullName = id.fullName
-        ctx.reporter.warning(s"Forcing verification of $fullName which was assumed verified")
+        // FIXME: qualified name of `id`
+        ctx.reporter.warning("Forcing verification of " + id + " which was assumed verified")
       }
     }
 

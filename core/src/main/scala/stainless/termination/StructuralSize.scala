@@ -5,7 +5,7 @@ package termination
 
 import scala.collection.mutable.{Map => MutableMap, ListBuffer}
 
-trait StructuralSize { self: SolverProvider =>
+trait StructuralSize {
 
   val checker: ProcessingPipeline
   import checker.program.trees._
@@ -14,7 +14,7 @@ trait StructuralSize { self: SolverProvider =>
 
   private val functions: ListBuffer[FunDef] = new ListBuffer[FunDef]
 
-  registerTransformer(new inox.ast.SymbolTransformer {
+  checker.registerTransformer(new inox.ast.SymbolTransformer {
     val s: trees.type = trees
     val t: trees.type = trees
 
@@ -54,7 +54,6 @@ trait StructuralSize { self: SolverProvider =>
         }
       })).typed
     functions += tfd.fd
-    clearSolvers()
     tfd
   })
 
@@ -76,22 +75,19 @@ trait StructuralSize { self: SolverProvider =>
    */
   def bvAbs2Integer(tpe: BVType): TypedFunDef = bv2IntegerCache.getOrElseUpdate(tpe, {
     val funID = FreshIdentifier("bvAbs2Integer$" + tpe.size)
-    val zero = BVLiteral(0, tpe.size)
-    val one = BVLiteral(1, tpe.size)
     val tfd = mkFunDef(funID)()(_ => (
-      Seq("x" :: tpe), IntegerType, { case Seq(x) =>
-        Ensuring(if_ (x === zero) {
+      Seq("x" :: Int32Type), IntegerType, { case Seq(x) =>
+        Ensuring(if_ (x === E(0)) {
           E(BigInt(0))
         } else_ {
-          if_ (x > zero) {
-            E(BigInt(1)) + E(funID)(x - one)
+          if_ (x > E(0)) {
+            E(BigInt(1)) + E(funID)(x - E(1))
           } else_ {
-            E(BigInt(1)) + E(funID)(-(x + one))
+            E(BigInt(1)) + E(funID)(-(x + E(1)))
           }
         }, \("res" :: IntegerType)(res => res >= E(BigInt(0))))
       })).typed
     functions += tfd.fd
-    clearSolvers()
     tfd
   })
 
@@ -122,18 +118,17 @@ trait StructuralSize { self: SolverProvider =>
             Seq(v.toVal),
             IntegerType,
             Ensuring(MatchExpr(v, (root match {
-              case sort: ADTSort => sort.typed(tparams).constructors
-              case cons: ADTConstructor => Seq(cons.typed(tparams))
+              case sort: ADTSort => sort.constructors
+              case cons: ADTConstructor => Seq(cons)
             }).map { cons =>
               val arguments = cons.fields.map(_.freshen)
               val argumentPatterns = arguments.map(vd => WildcardPattern(Some(vd)))
               val base: Expr = if (cons.fields.nonEmpty) IntegerLiteral(1) else IntegerLiteral(0)
               val rhs = arguments.map(vd => fullSize(vd.toVariable)).foldLeft(base)(_ + _)
-              MatchCase(ADTPattern(None, cons.toType, argumentPatterns), None, rhs)
+              MatchCase(ADTPattern(None, cons.typed(tparams).toType, argumentPatterns), None, rhs)
             }), \("res" :: IntegerType)(res => res >= E(BigInt(0)))),
             Set.empty
           )
-          clearSolvers()
 
           id
       }

@@ -9,6 +9,11 @@ trait Trees extends imperative.Trees { self =>
     override def getType(implicit s: Symbols): Type = tp
   }
 
+  override def ppBody(tree: Tree)(implicit ctx: PrinterContext): Unit = tree match {
+    case Hole(tp) => p"???[$tp]"
+    case _ => super.ppBody(tree)
+  }
+
   override def getDeconstructor(that: inox.ast.Trees) = that match {
     case tree: Trees => new TreeDeconstructor {
       protected val s: self.type = self
@@ -16,16 +21,6 @@ trait Trees extends imperative.Trees { self =>
     }.asInstanceOf[inox.ast.TreeDeconstructor { val s: self.type; val t: that.type }]
 
     case _ => super.getDeconstructor(that)
-  }
-}
-
-trait Printer extends imperative.Printer {
-  protected val trees: Trees
-  import trees._
-
-  override def ppBody(tree: Tree)(implicit ctx: PrinterContext): Unit = tree match {
-    case Hole(tp) => p"???[$tp]"
-    case _ => super.ppBody(tree)
   }
 }
 
@@ -39,4 +34,5 @@ trait TreeDeconstructor extends imperative.TreeDeconstructor {
     case other =>
       super.deconstruct(other)
   }
+
 }

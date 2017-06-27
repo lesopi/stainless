@@ -11,7 +11,5 @@ package object termination {
       functions: Map[Identifier, FunDef],
       adts: Map[Identifier, ADTDefinition]
     ) extends SimpleSymbols with AbstractSymbols
-
-    object printer extends ast.Printer { val trees: termination.trees.type = termination.trees }
   }
 }

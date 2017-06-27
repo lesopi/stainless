@@ -3,10 +3,7 @@
 package stainless
 package transformers
 
-trait CollectorWithPC extends TransformerWithPC with inox.transformers.CollectorWithPC {
-  import symbols._
-  lazy val pp = implicitly[PathProvider[Path]]
-}
+trait CollectorWithPC extends TransformerWithPC with inox.transformers.CollectorWithPC
 
 object CollectorWithPC {
   def apply[T](t: ast.Trees)

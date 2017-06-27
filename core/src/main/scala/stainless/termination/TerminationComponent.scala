@@ -4,10 +4,6 @@ package stainless
 package termination
 
 import inox.utils.ASCIIHelpers._
-import stainless.utils.JsonConvertions._
-
-import org.json4s.JsonDSL._
-import org.json4s.JsonAST.{ JArray, JValue }
 
 object TerminationComponent extends SimpleComponent {
   val name = "termination"
@@ -35,11 +31,7 @@ object TerminationComponent extends SimpleComponent {
             }
 
             t.Assert(
-              t.andJoin(es.map(e => t.GreaterEquals(e, e.getType(syms) match {
-                case s.BVType(size) => t.BVLiteral(0, size)
-                case s.IntegerType => t.IntegerLiteral(0)
-                case _ => throw new inox.FatalError("Unexpected measure type for " + e)
-              }))),
+              t.andJoin(es.map(e => t.GreaterEquals(e, t.IntegerLiteral(0)))),
               Some("Measure not guaranteed positive"),
               transform(body)
             ).copiedFrom(e)
@@ -70,7 +62,19 @@ object TerminationComponent extends SimpleComponent {
         Cell(fd.id.asString),
         Cell {
           val result = if (g.isGuaranteed) "\u2713" else "\u2717"
-          s"$result ${verdict(g, fd)}"
+          val verdict = g match {
+            case checker.LoopsGivenInputs(reason, args) =>
+              s"Non-terminating for call: ${fd.id.asString}(${args.map(_.asString).mkString(",")})"
+            case checker.MaybeLoopsGivenInputs(reason, args) =>
+              s"Possibly non-terminating for call: ${fd.id.asString}(${args.map(_.asString).mkString(",")})"
+            case checker.CallsNonTerminating(fds) =>
+              s"Calls non-terminating functions: ${fds.map(_.id.asString).mkString(",")}"
+            case checker.Terminates(reason) =>
+              s"Terminates ($reason)"
+            case checker.NoGuarantee =>
+              "No guarantee"
+          }
+          s"$result $verdict"
         }
       ))
 
@@ -83,43 +87,6 @@ object TerminationComponent extends SimpleComponent {
 
       ctx.reporter.info(t.render)
     }
-
-    def emitJson(): JValue = {
-      def kind(g: TerminationGuarantee): String = g match {
-        case checker.LoopsGivenInputs(_, _) => "non-terminating loop"
-        case checker.MaybeLoopsGivenInputs(_, _) => "possibly non-terminating loop"
-        case checker.CallsNonTerminating(_) => "non-terminating call"
-        case checker.DecreasesFailed => "failed decreases check"
-        case checker.Terminates(_) => "terminates"
-        case checker.NoGuarantee => "no guarantee"
-      }
-
-      val report: JArray = for { (fd, g) <- results } yield {
-        ("fd" -> fd.id.name) ~
-        ("pos" -> fd.getPos.toJson) ~
-        ("kind" -> kind(g)) ~ // brief
-        ("verdict" -> verdict(g, fd)) ~ // detailed
-        ("guarantee" -> g.isGuaranteed)
-      }
-
-      report
-    }
-
-    private def verdict(g: TerminationGuarantee, fd: FunDef): String = g match {
-      case checker.LoopsGivenInputs(reason, args) =>
-        s"Non-terminating for call: ${fd.id.asString}(${args.map(_.asString).mkString(",")})"
-      case checker.MaybeLoopsGivenInputs(reason, args) =>
-        s"Possibly non-terminating for call: ${fd.id.asString}(${args.map(_.asString).mkString(",")})"
-      case checker.CallsNonTerminating(fds) =>
-        s"Calls non-terminating functions: ${fds.map(_.id.asString).mkString(",")}"
-      case checker.DecreasesFailed =>
-        s"Failed decreases check"
-      case checker.Terminates(reason) =>
-        s"Terminates ($reason)"
-      case checker.NoGuarantee =>
-        "No guarantee"
-    }
-
   }
 
   def apply(funs: Seq[Identifier], p: Program { val trees: termination.trees.type }): TerminationReport = {
@@ -131,14 +98,11 @@ object TerminationComponent extends SimpleComponent {
 
     val timer = ctx.timers.termination.start()
 
-    val toVerify = funs.map(getFunction(_)).sortBy(_.getPos)
-
-    for (fd <- toVerify)  {
-      if (fd.flags contains "library") {
-        val fullName = fd.id.fullName
-        ctx.reporter.warning(s"Forcing termination checking of $fullName which was assumed terminating")
-      }
-    }
+    val toVerify = for {
+      id <- funs
+      fd = getFunction(id)
+      if !(fd.flags contains "library")
+    } yield fd
 
     val res = for (fd <- toVerify) yield fd -> c.terminates(fd)
     val t = timer.stop()

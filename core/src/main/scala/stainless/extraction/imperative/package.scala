@@ -3,8 +3,6 @@
 package stainless
 package extraction
 
-import scala.language.existentials
-
 package object imperative {
 
   object trees extends imperative.Trees with inox.ast.SimpleSymbols {
@@ -12,8 +10,6 @@ package object imperative {
       functions: Map[Identifier, FunDef],
       adts: Map[Identifier, ADTDefinition]
     ) extends SimpleSymbols with AbstractSymbols
-
-    object printer extends Printer { val trees: imperative.trees.type = imperative.trees }
   }
 
   case class ImperativeEliminationException(pos: inox.utils.Position, msg: String) extends Exception(msg)

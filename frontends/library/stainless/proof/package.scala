@@ -19,7 +19,7 @@ package object proof {
     }
   }
 
-  @library @inline
+  @library
   implicit def boolean2ProofOps(prop: Boolean): ProofOps = ProofOps(prop)
 
   @library

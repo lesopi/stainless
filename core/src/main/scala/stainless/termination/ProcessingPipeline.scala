@@ -6,13 +6,13 @@ package termination
 import scala.concurrent.duration._
 import scala.collection.mutable.{PriorityQueue, Map => MutableMap, Set => MutableSet}
 
-import scala.language.existentials
-
 trait ProcessingPipeline extends TerminationChecker with inox.utils.Interruptible { self =>
   import program._
   import program.trees._
   import program.symbols._
   import CallGraphOrderings._
+
+  private[termination] lazy val ignorePosts = ctx.options.findOptionOrDefault(optIgnorePosts)
 
   trait Problem {
     def funSet: Set[FunDef]
@@ -43,9 +43,84 @@ trait ProcessingPipeline extends TerminationChecker with inox.utils.Interruptibl
 
   sealed abstract class Result(funDef: FunDef)
   case class Cleared(funDef: FunDef) extends Result(funDef)
-  case class Broken(funDef: FunDef, reason: NonTerminating) extends Result(funDef)
+  case class Broken(funDef: FunDef, args: Seq[Expr]) extends Result(funDef)
+  case class MaybeBroken(funDef: FunDef, args: Seq[Expr]) extends Result(funDef)
 
   protected val processors: List[Processor { val checker: self.type }]
+
+  protected val encoder: ast.TreeTransformer {
+    val s: program.trees.type
+    val t: stainless.trees.type
+  }
+
+  protected implicit val semanticsProvider: inox.SemanticsProvider { val trees: program.trees.type } =
+    encodingSemantics(program.trees)(encoder)
+
+  private def solverFactory(transformer: inox.ast.SymbolTransformer { val s: trees.type; val t: trees.type }) = {
+    val transformEncoder = inox.ast.ProgramEncoder(program)(transformer)
+
+    object programEncoder extends {
+      val sourceProgram: transformEncoder.targetProgram.type = transformEncoder.targetProgram
+      val t: stainless.trees.type = stainless.trees
+    } with inox.ast.ProgramEncoder {
+      val encoder = self.encoder
+      object decoder extends ast.TreeTransformer {
+        val s: stainless.trees.type = stainless.trees
+        val t: trees.type = trees
+      }
+    }
+
+    val p: transformEncoder.targetProgram.type = transformEncoder.targetProgram
+    val timeout = ctx.options.findOption(inox.optTimeout) match {
+      case Some(to) => to / 100
+      case None => 2.5.seconds
+    }
+
+    solvers.SolverFactory
+      .getFromSettings(p, options)(programEncoder)(p.getSemantics)
+      .withTimeout(timeout)
+  }
+
+  private def solverAPI(transformer: inox.ast.SymbolTransformer { val s: trees.type; val t: trees.type }) = {
+    inox.solvers.SimpleSolverAPI(solverFactory(transformer))
+  }
+
+  private object withoutPosts extends inox.ast.SimpleSymbolTransformer {
+    val s: trees.type = trees
+    val t: trees.type = trees
+
+    protected def transformFunction(fd: FunDef): FunDef = {
+      // When using the loop processor, it helps to ignore postconditions in the
+      // current SCC as these will sometimes disallow models otherwise
+      val isLoop = problems.headOption.exists {
+        case (_, idx) => processorArray(idx).isInstanceOf[LoopProcessor]
+      }
+
+      if (isProblem(fd, ignoreSCC = !isLoop) || ignorePosts) {
+        fd.copy(fullBody = exprOps.withPostcondition(fd.fullBody, None))
+      } else {
+        fd
+      }
+    }
+
+    protected def transformADT(adt: ADTDefinition): ADTDefinition = adt
+  }
+
+  private var transformers: inox.ast.SymbolTransformer { val s: trees.type; val t: trees.type } = withoutPosts
+
+  private[termination] def registerTransformer(
+    transformer: inox.ast.SymbolTransformer { val s: trees.type; val t: trees.type }
+  ): Unit = transformers = transformers andThen transformer
+
+  def solveVALID(e: Expr) = solverAPI(transformers).solveVALID(e)
+  def solveVALID(e: Expr, t: inox.ast.SymbolTransformer { val s: trees.type; val t: trees.type }) = {
+    solverAPI(transformers andThen t).solveVALID(e)
+  }
+
+  def solveSAT(e: Expr) = solverAPI(transformers).solveSAT(e)
+  def solveSAT(e: Expr, t: inox.ast.SymbolTransformer { val s: trees.type; val t: trees.type }) = {
+    solverAPI(transformers andThen t).solveSAT(e)
+  }
 
   private lazy val processorArray: Array[Processor { val checker: self.type }] = {
     assert(processors.nonEmpty)
@@ -86,15 +161,16 @@ trait ProcessingPipeline extends TerminationChecker with inox.utils.Interruptibl
   private val problems = new PriorityQueue[(Problem, Int)]
   def running = problems.nonEmpty
 
-  private val clearedMap     : MutableMap[FunDef, String]                   = MutableMap.empty
-  private val brokenMap      : MutableMap[FunDef, (String, NonTerminating)] = MutableMap.empty
+  private val clearedMap     : MutableMap[FunDef, String]              = MutableMap.empty
+  private val brokenMap      : MutableMap[FunDef, (String, Seq[Expr])] = MutableMap.empty
+  private val maybeBrokenMap : MutableMap[FunDef, (String, Seq[Expr])] = MutableMap.empty
 
   private val unsolved     : MutableSet[Problem] = MutableSet.empty
   private val dependencies : MutableSet[Problem] = MutableSet.empty
 
-  def isProblem(fd: FunDef): Boolean = {
+  def isProblem(fd: FunDef, ignoreSCC: Boolean = false): Boolean = {
     lazy val callees = transitiveCallees(fd)
-    lazy val problemDefs = problems.flatMap(_._1.funDefs).toSet
+    lazy val problemDefs = (if (ignoreSCC) problems.drop(1) else problems).flatMap(_._1.funDefs).toSet
     unsolved.exists(_.contains(fd)) ||
     dependencies.exists(_.contains(fd)) || 
     unsolved.exists(_.funDefs exists callees) ||
@@ -123,9 +199,10 @@ trait ProcessingPipeline extends TerminationChecker with inox.utils.Interruptibl
   private def printResult(results: List[Result]) {
     val sb = new StringBuilder()
     sb.append("- Processing Result:\n")
-    for (result <- results) result match {
+    for(result <- results) result match {
       case Cleared(fd) => sb.append(f"    ${fd.id}%-10s Cleared\n")
-      case Broken(fd, reason) => sb.append(f"    ${fd.id}%-10s ${"Broken with reason: " + reason}\n")
+      case Broken(fd, args) => sb.append(f"    ${fd.id}%-10s ${"Broken for arguments: " + args.mkString("(", ",", ")")}\n")
+      case MaybeBroken(fd, args) => sb.append(f"    ${fd.id}%-10s ${"HO construct application breaks for arguments: " + args.mkString("(", ",", ")")}\n")
     }
     reporter.debug(sb.toString)
   }
@@ -134,9 +211,10 @@ trait ProcessingPipeline extends TerminationChecker with inox.utils.Interruptibl
   def terminates(funDef: FunDef): TerminationGuarantee = {
     val guarantee = {
       terminationMap.get(funDef) orElse
-      brokenMap.get(funDef).map(_._2) getOrElse {
+      brokenMap.get(funDef).map { case (reason, args) => LoopsGivenInputs(reason, args) } orElse
+      maybeBrokenMap.get(funDef).map { case (reason, args) => MaybeLoopsGivenInputs(reason, args)} getOrElse {
         val callees = transitiveCallees(funDef)
-        val broken = brokenMap.keys.toSet
+        val broken = brokenMap.keys.toSet ++ maybeBrokenMap.keys
         val brokenCallees = callees intersect broken
         if (brokenCallees.nonEmpty) {
           CallsNonTerminating(brokenCallees)
@@ -224,10 +302,14 @@ trait ProcessingPipeline extends TerminationChecker with inox.utils.Interruptibl
         reporter.info(s"Result for ${fd.id}")
         reporter.info(s" => CLEARED ($reason)")
         clearedMap(fd) = reason
-      case Broken(fd, msg) =>
+      case Broken(fd, args) =>
         reporter.info(s"Result for ${fd.id}")
-        reporter.info(s" => BROKEN ($reason) -> $msg")
-        brokenMap(fd) = (reason, msg)
+        reporter.info(s" => BROKEN (for call ${fd.id}(${args.map(_.asString).mkString(",")})")
+        brokenMap(fd) = (reason, args)
+      case MaybeBroken(fd, args) =>
+        reporter.info(s"Result for ${fd.id}")
+        reporter.info(s" => MAYBE BROKEN (for call ${fd.id}(${args.map(_.asString).mkString(",")})")
+        maybeBrokenMap(fd) = (reason, args)
     }
 
     val verified = terminationProblems.flatMap(_.funDefs).toSet.filter(!isProblem(_))

@@ -10,8 +10,6 @@ package object inlining {
       functions: Map[Identifier, FunDef],
       adts: Map[Identifier, ADTDefinition]
     ) extends SimpleSymbols with AbstractSymbols
-
-    object printer extends Printer { val trees: inlining.trees.type = inlining.trees }
   }
 
   object extractor extends FunctionInlining {

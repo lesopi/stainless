@@ -12,25 +12,18 @@ import core.Symbols._
 import core.Types._
 import core.Flags._
 
-import scala.collection.mutable.{ Map => MutableMap }
-
 trait ASTExtractors {
 
   protected implicit val ctx: Context
 
   def classFromName(nameStr: String): ClassSymbol = ctx.requiredClass(typeName(nameStr))
 
-  def getAnnotations(sym: Symbol, ignoreOwner: Boolean = false): Map[String, Seq[tpd.Tree]] = {
-    (for {
-      a <- sym.annotations ++ (if (!ignoreOwner) sym.owner.annotations else Set.empty)
-      name = a.symbol.fullName.toString.replaceAll("\\.package\\$\\.", ".")
-      if name startsWith "stainless.annotation."
-      shortName = name drop "stainless.annotation.".length
-    } yield (shortName, a.arguments)).toMap
-  }
-
   // Well-known symbols that we match on
 
+  protected lazy val tuple2Sym    = classFromName("scala.Tuple2")
+  protected lazy val tuple3Sym    = classFromName("scala.Tuple3")
+  protected lazy val tuple4Sym    = classFromName("scala.Tuple4")
+  protected lazy val tuple5Sym    = classFromName("scala.Tuple5")
   protected lazy val scalaMapSym  = classFromName("scala.collection.immutable.Map")
   protected lazy val scalaSetSym  = classFromName("scala.collection.immutable.Set")
   protected lazy val setSym       = classFromName("stainless.lang.Set")
@@ -58,25 +51,23 @@ trait ASTExtractors {
     classFromName("scala.Function" + i)
   }
 
-  def isTuple(sym: Symbol, size: Int): Boolean = (size > 0) && (sym == classFromName(s"scala.Tuple$size"))
+  def isTuple2(sym: Symbol) : Boolean = sym == tuple2Sym
+  def isTuple3(sym: Symbol) : Boolean = sym == tuple3Sym
+  def isTuple4(sym: Symbol) : Boolean = sym == tuple4Sym
+  def isTuple5(sym: Symbol) : Boolean = sym == tuple5Sym
 
   object TupleSymbol {
-    // It is particularly time expensive so we cache this.
-    private val cache = MutableMap[Symbol, Option[Int]]()
-    private val cardinality = """Tuple(\d{1,2})""".r
-    def unapply(sym: Symbol): Option[Int] = cache.getOrElseUpdate(sym, {
-      // First, extract a guess about the cardinality of the Tuple.
-      // Then, confirm that this is indeed a regular Tuple.
-      val name = sym.originalName.toString
-      name match {
-        case cardinality(i) if isTuple(sym, i.toInt) => Some(i.toInt)
-        case _ => None
+    private val tupleSyms = Seq(tuple2Sym, tuple3Sym, tuple4Sym, tuple5Sym)
+    def unapply(sym: Symbol): Option[Int] = {
+      val idx = tupleSyms.indexOf(sym)
+      if (idx >= 0) {
+        Some(idx + 2)
+      } else {
+        None
       }
-    })
+    }
 
-    def unapply(tpe: Type): Option[Int] = tpe.classSymbols.collectFirst { case TupleSymbol(i) => i }
-
-    def unapply(tree: tpd.Tree): Option[Int] = unapply(tree.tpe)
+    def unapply(tree: tpd.Tree): Option[Int] = unapply(tree.tpe.typeSymbol)
   }
 
   def isBigIntSym(sym: Symbol) : Boolean = getResolvedTypeSym(sym) == bigIntSym
@@ -212,20 +203,6 @@ trait ASTExtractors {
       }
     }
 
-    object ExInt8Literal {
-      def unapply(tree: tpd.Literal): Option[Byte] = tree match {
-        case Literal(c @ Constant(i)) if c.tpe.classSymbol == defn.ByteClass => Some(c.byteValue)
-        case _ => None
-      }
-    }
-
-    object ExInt16Literal {
-      def unapply(tree: tpd.Literal): Option[Short] = tree match {
-        case Literal(c @ Constant(i)) if c.tpe.classSymbol == defn.ShortClass => Some(c.shortValue)
-        case _ => None
-      }
-    }
-
     object ExInt32Literal {
       def unapply(tree: tpd.Literal): Option[Int] = tree match {
         case Literal(c @ Constant(i)) if c.tpe.classSymbol == defn.IntClass => Some(c.intValue)
@@ -233,17 +210,10 @@ trait ASTExtractors {
       }
     }
 
-    object ExInt64Literal {
-      def unapply(tree: tpd.Literal): Option[Long] = tree match {
-        case Literal(c @ Constant(i)) if c.tpe.classSymbol == defn.LongClass => Some(c.longValue)
-        case _ => None
-      }
-    }
-
     object ExBigIntLiteral {
       def unapply(tree: tpd.Tree): Option[tpd.Tree] = tree match {
-        case Apply(ExSymbol("scala", "math", "BigInt$", "apply"), Seq(i)) => Some(i)
-        case Apply(ExSymbol("stainless", "lang", "package$", "BigInt$", "apply"), Seq(i)) => Some(i)
+        case Apply(ExSymbol("scala", "package", "BigInt$", "apply"), Seq(i)) => Some(i)
+        case Apply(ExSymbol("stainless", "lang", "package", "BigInt$", "apply"), Seq(i)) => Some(i)
         case _ => None
       }
     }
@@ -272,96 +242,38 @@ trait ASTExtractors {
       }
     }
 
-    object ExThisCall {
-      def unapply(tree: tpd.Tree): Option[(ThisType, Symbol, Seq[tpd.Tree], Seq[tpd.Tree])] = {
-        val optCall = tree match {
-          case id @ Ident(_) => Some((id, Nil, Nil))
-          case Apply(id @ Ident(_), args) => Some((id, Nil, args))
-          case TypeApply(id @ Ident(_), tps) => Some((id, tps, Nil))
-          case Apply(TypeApply(id @ Ident(_), tps), args) => Some((id, tps, args))
-          case _ => None
-        }
-
-        optCall.flatMap { case (id, tps, args) =>
-          id.tpe match {
-            case ref @ TermRef(tt: ThisType, _) if !(ref.symbol.owner is Module) =>
-              Some((tt, id.symbol, tps, args))
-            case _ => None
-          }
-        }
-      }
-    }
-
-    // Dotc seems slightly less consistent than scalac: it uses to format for
-    // casts. Like scalac, it uses Select for `.toByte`, but it also uses
-    // Apply("byte2int", arg) for implicit conversions (and perhaps for other
-    // conversions as well).
-    object ExCastCall {
-      // Returns: (arg, from, to)
-      def unapply(tree: tpd.Tree): Option[(tpd.Tree, Type, Type)] = tree match {
-        case Apply(Ident(name), List(arg)) =>
-          val tmp: Option[(Symbol, Symbol)] = name.toString match {
-            case "byte2short" => Some(defn.ByteClass, defn.ShortClass)
-            case "byte2int"   => Some(defn.ByteClass, defn.IntClass)
-            case "byte2long"  => Some(defn.ByteClass, defn.LongClass)
-
-            case "short2byte" => Some(defn.ShortClass, defn.ByteClass)
-            case "short2int"  => Some(defn.ShortClass, defn.IntClass)
-            case "short2long" => Some(defn.ShortClass, defn.LongClass)
-
-            case "int2byte"   => Some(defn.IntClass, defn.ByteClass)
-            case "int2short"  => Some(defn.IntClass, defn.ShortClass)
-            case "int2long"   => Some(defn.IntClass, defn.LongClass)
-
-            case "long2byte"  => Some(defn.LongClass, defn.ByteClass)
-            case "long2short" => Some(defn.LongClass, defn.ShortClass)
-            case "long2int"   => Some(defn.LongClass, defn.IntClass)
-
-            case _ => None
-          }
-
-          tmp map { case (from, to) => (arg, from.info, to.info) }
-        case _ => None
-      }
-    }
-
     object ExCall {
-      def unapply(tree: tpd.Tree): Option[(Option[tpd.Tree], Symbol, Seq[tpd.Tree], Seq[tpd.Tree])] = {
-        val optCall = tree match {
-          case tree @ Ident(_) => Some((None, tree.symbol, Nil, Nil))
-          case tree @ Select(qualifier, _) => Some((Some(qualifier), tree.symbol, Nil, Nil))
-          case tree @ Apply(id: tpd.Ident, args) => Some((None, id.symbol, Nil, args))
-          case tree @ Apply(select @ Select(qualifier, _), args) => Some((Some(qualifier), select.symbol, Nil, args))
-          case tree @ TypeApply(id: tpd.Ident, tps) => Some((None, id.symbol, tps, Nil))
-          case tree @ TypeApply(select @ Select(qualifier, _), tps) => Some((Some(qualifier), select.symbol, tps, Nil))
-          case tree @ Apply(ExCall(caller, sym, tps, args), newArgs) => Some((caller, sym, tps, args ++ newArgs))
-          case tree @ TypeApply(ExCall(caller, sym, tps, args), newTps) => Some((caller, sym, tps ++ newTps, args))
-          case _ => None
-        }
+      def unapply(tree: tpd.Tree): Option[(Option[tpd.Tree], Symbol, Seq[tpd.Tree], Seq[tpd.Tree])] = tree match {
+        case tree @ Select(qualifier, _) =>
+          Some((Some(qualifier), tree.symbol, Nil, Nil))
 
-        optCall.map { case (rec, sym, tps, args) => (rec.filterNot(_.symbol is Module), sym, tps, args) }
+        case tree @ Apply(id: tpd.Ident, args) =>
+          Some((None, id.symbol, Nil, args))
+
+        case tree @ Apply(select @ Select(qualifier, _), args) =>
+          Some((Some(qualifier), select.symbol, Nil, args))
+
+        case tree @ TypeApply(id: tpd.Ident, tps) =>
+          Some((None, id.symbol, tps, Nil))
+
+        case tree @ TypeApply(select @ Select(qualifier, _), tps) =>
+          Some((Some(qualifier), select.symbol, tps, Nil))
+
+        case tree @ Apply(ExCall(caller, sym, tps, args), newArgs) =>
+          Some((caller, sym, tps, args ++ newArgs))
+
+        case tree @ TypeApply(ExCall(caller, sym, tps, args), newTps) =>
+          Some((caller, sym, tps ++ newTps, args))
+
+        case _ =>
+          None
       }
     }
 
-    object ExConstructor {
+    object ExADT {
       def unapply(tree: tpd.Tree): Option[(Type, Seq[tpd.Tree])] = tree match {
         case Apply(Select(New(tpt), CONSTRUCTOR), args) =>
           Some((tpt.tpe, args))
-
-        case Apply(TypeApply(Select(New(tpt), CONSTRUCTOR), _), args) =>
-          Some((tree.tpe, args))
-
-        case Apply(e, args) if (
-          (e.symbol.owner is Module) &&
-          (e.symbol is Synthetic) &&
-          (e.symbol.name.toString == "apply")
-        ) => Some((tree.tpe, args))
-
-        case Select(s, _) if (tree.symbol is Case) && (tree.symbol is Module) =>
-          Some((tree.tpe, Seq()))
-
-        case Ident(_) if (tree.symbol is Case) && (tree.symbol is Module) =>
-          Some((tree.tpe, Seq()))
 
         case _ =>
           None
@@ -370,11 +282,11 @@ trait ASTExtractors {
 
     object ExTuple {
       def unapply(tree: tpd.Tree): Option[Seq[tpd.Tree]] = tree match {
-        case Apply(Select(New(tupleType), nme.CONSTRUCTOR), args) if isTuple(tupleType.symbol, args.size) =>
+        case Apply(Select(New(TupleSymbol(i)), nme.CONSTRUCTOR), args) if args.size == i =>
           Some(args)
         case Apply(TypeApply(Select(
           Apply(TypeApply(ExSymbol("scala", "Predef$", "ArrowAssoc"), Seq(_)), Seq(from)),
-          ExNamed("->") | ExNamed("$minus$greater")
+          ExNamed("$minus$greater")
         ), Seq(_)), Seq(to)) => Some(Seq(from, to))
         case _ => None
       }
@@ -387,19 +299,6 @@ trait ASTExtractors {
         case Select(tuple @ TupleSymbol(i), ExNamed(Pattern(n))) if n.toInt <= i =>
           Some((tuple, n.toInt))
         case _ => None
-      }
-    }
-
-    object ExUnwrapped {
-      def unapply(tree: tpd.Tree): Option[tpd.Tree] = tree match {
-        case Apply(
-          ExSymbol("scala", "Predef$", "Ensuring") |
-          ExSymbol("stainless", "lang", "StaticChecks$", "any2Ensuring"), Seq(arg)) => Some(arg)
-        case Apply(ExSymbol("stainless", "lang", "package$", "BooleanDecorations"), Seq(arg)) => Some(arg)
-        case Apply(ExSymbol("stainless", "lang", "package$", "SpecsDecorations"), Seq(arg)) => Some(arg)
-        case Apply(ExSymbol("stainless", "lang", "package$", "StringDecorations"), Seq(arg)) => Some(arg)
-        case Apply(ExSymbol("stainless", "lang", "package$", "WhileDecorations"), Seq(arg)) => Some(arg)
-        case _ => Some(tree)
       }
     }
   }
@@ -422,21 +321,10 @@ trait ASTExtractors {
 
     object ExFunctionDef {
       def unapply(dd: tpd.DefDef): Option[(Symbol, Seq[tpd.TypeDef], Seq[tpd.ValDef], Type, tpd.Tree)] = dd match {
-        case DefDef(name, tparams, vparamss, tpt, rhs) =>
-          if ((
-            name != nme.CONSTRUCTOR &&
-            !dd.symbol.is(Accessor) &&
-            !dd.symbol.is(Synthetic) &&
-            !dd.symbol.is(Label)
-          ) || (
-            (dd.symbol is Synthetic) &&
-            (dd.symbol is Implicit) &&
-            !(getAnnotations(tpt.symbol) contains "ignore")
-          )) {
-            Some((dd.symbol, tparams, vparamss.flatten, tpt.tpe, dd.rhs))
-          } else {
-            None
-          }
+        case DefDef(name, tparams, vparamss, tpt, rhs) if (
+          name != nme.CONSTRUCTOR && !dd.symbol.is(Accessor) &&
+          !dd.symbol.is(Synthetic)
+        ) => Some((dd.symbol, tparams, vparamss.flatten, tpt.tpe, dd.rhs))
 
         case _ => None
       }
@@ -448,15 +336,27 @@ trait ASTExtractors {
         tree match {
           case vd @ ValDef(_, tpt, _) if (
             !(sym is CaseAccessor) && !(sym is ParamAccessor) &&
-            !(sym is Synthetic) && !(sym is Accessor) && !(sym is Mutable)
+            !(sym is Lazy) && !(sym is Synthetic) && !(sym is Accessor) && !(sym is Mutable)
           ) => Some((sym, tpt.tpe, vd.rhs))
 
-          /*
           case dd @ DefDef(_, _, _, tpt, _) if (
             (sym is Stable) && (sym is Accessor) &&
             (sym.name != nme.CONSTRUCTOR) // TODO: && (sym.accessed == NoSymbol)
           ) => Some((sym, tpt.tpe, tpd.EmptyTree))
-          */
+
+          case _ => None
+        }
+      }
+    }
+
+    object ExLazyFieldDef {
+      def unapply(tree: tpd.DefDef): Option[(Symbol, Type, tpd.Tree)] = {
+        val sym = tree.symbol
+        tree match {
+          case DefDef(name, _, Seq() | Seq(_), tpt, _) if (
+            name != nme.CONSTRUCTOR && !(sym is Synthetic) &&
+            (sym is Accessor) && (sym is Lazy)
+          ) => Some((sym, tpt.tpe, tree.rhs))
 
           case _ => None
         }
@@ -477,32 +377,9 @@ trait ASTExtractors {
       }
     }
 
-    object ExWhile {
-      def unapply(trees: List[tpd.Tree]): Option[(tpd.Tree, List[tpd.Tree], List[tpd.Tree])] = trees match {
-        case (dd @ DefDef(nme.WHILE_PREFIX, Seq(), Seq(Seq()), unit, _)) :: app :: rest => dd.rhs match {
-          case If(cond, Block(body, Apply(c, Nil)), ExUnitLiteral()) if dd.symbol == c.symbol => app match {
-            case Apply(c, Nil) if dd.symbol == c.symbol => Some((cond, body, rest))
-            case Apply(
-              ExSymbol("stainless", "lang", "package$", "WhileDecorations"),
-              Seq(Apply(c, Nil))) if dd.symbol == c.symbol => Some((cond, body, rest))
-            case _ => None
-          }
-          case _ => None
-        }
-        case _ => None
-      }
-    }
-
     object ExRequire {
       def unapply(tree: tpd.Apply): Option[tpd.Tree] = tree match {
         case Apply(ExSymbol("scala", "Predef$", "require"), Seq(body)) => Some(body)
-        case _ => None
-      }
-    }
-
-    object ExDecreases {
-      def unapply(tree: tpd.Apply): Option[Seq[tpd.Tree]] = tree match {
-        case Apply(ExSymbol("stainless", "lang", "package$", "decreases"), args) => Some(args)
         case _ => None
       }
     }
@@ -540,19 +417,9 @@ trait ASTExtractors {
     object ExBecause {
       def unapply(tree: tpd.Tree): Option[(tpd.Tree, tpd.Tree)] = tree match {
         case ExCall(Some(rec),
-          ExSymbol("stainless", "proof", "package$", "ProofOps", "because"),
-          Seq(), Seq(proof)
-        ) =>
-          def extract(t: tpd.Tree): Option[tpd.Tree] = t match {
-            case Apply(ExSymbol("stainless", "proof", "package$", "ProofOps$", "apply"), Seq(body)) => Some(body)
-            case Block(Seq(v @ ValDef(_, _, _)), e) => extract(e).filter(_.symbol == v.symbol).map(_ => v.rhs)
-            case Inlined(_, members, last) => extract(Block(members, last))
-            case _ => None
-          }
-          extract(rec).map(_ -> proof)
-
-        case _ =>
-          None
+          ExSymbol("stainless", "proof", "package$", "boolean2ProofOps", "because"),
+          Seq(), Seq(proof)) => Some((rec, proof))
+        case _ => None
       }
     }
 
@@ -565,46 +432,14 @@ trait ASTExtractors {
       }
     }
 
-    object ExFunctionSpecs {
-      def unapply(tree: tpd.Tree): Option[tpd.Tree] = tree match {
-        case Apply(TypeApply(ExSymbol("stainless", "lang", "package$", "FunctionSpecs0"), Seq(_)), Seq(f)) => Some(f)
-        case Apply(TypeApply(ExSymbol("stainless", "lang", "package$", "FunctionSpecs1"), Seq(_, _)), Seq(f)) => Some(f)
-        case Apply(TypeApply(ExSymbol("stainless", "lang", "package$", "FunctionSpecs2"), Seq(_, _, _)), Seq(f)) => Some(f)
-        case Apply(TypeApply(ExSymbol("stainless", "lang", "package$", "FunctionSpecs3"), Seq(_, _, _, _)), Seq(f)) => Some(f)
-        case Apply(TypeApply(ExSymbol("stainless", "lang", "package$", "FunctionSpecs4"), Seq(_, _, _, _, _)), Seq(f)) => Some(f)
-
-        case Select(ExSymbol("stainless", "lang", "package$", "FunctionSpecs0"), ExNamed("f")) => Some(tree)
-        case Select(ExSymbol("stainless", "lang", "package$", "FunctionSpecs1"), ExNamed("f")) => Some(tree)
-        case Select(ExSymbol("stainless", "lang", "package$", "FunctionSpecs2"), ExNamed("f")) => Some(tree)
-        case Select(ExSymbol("stainless", "lang", "package$", "FunctionSpecs3"), ExNamed("f")) => Some(tree)
-        case Select(ExSymbol("stainless", "lang", "package$", "FunctionSpecs4"), ExNamed("f")) => Some(tree)
-
+    object ExWhile {
+      def unapply(tree: tpd.Tree): Option[(tpd.Tree, Seq[tpd.Tree])] = tree match {
+        case dd @ DefDef(nme.WHILE_PREFIX, Seq(), Seq(), unit, _) => dd.rhs match {
+          case If(cond, Block(body, Apply(caller, Nil)), ExUnitLiteral()) if dd.symbol == caller.symbol => Some((cond, body))
+          case _ => None
+        }
         case _ => None
       }
-    }
-
-    object ExPre {
-      def unapply(tree: tpd.Select): Option[tpd.Tree] = tree match {
-        case Select(ExFunctionSpecs(f), ExNamed("pre")) => Some(f)
-        case _ => None
-      }
-    }
-
-    object ExOld {
-      def unapply(tree: tpd.Apply): Option[tpd.Tree] = tree match {
-        case Apply(TypeApply(ExSymbol("stainless", "lang", "package$", "old"), Seq(_)), Seq(arg)) => Some(arg)
-        case _ => None
-      }
-    }
-  }
-
-  object ExIdentity {
-    def unapply(tree: tpd.Apply): Option[tpd.Tree] = tree match {
-      case Apply(TypeApply(ExSymbol("scala", "Predef$", "identity"), Seq(_)), Seq(body)) =>
-        Some(body)
-      case Apply(TypeApply(ExSymbol("scala", "Predef$", "locally"), Seq(_)), Seq(body)) =>
-        Some(body)
-      case _ => None
     }
   }
 

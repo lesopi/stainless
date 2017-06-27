@@ -2,9 +2,7 @@
 
 package stainless
 
-import org.json4s.JsonAST.JValue
 import extraction.xlang.{trees => xt}
-import scala.language.existentials
 
 trait Component {
   val name: String
@@ -19,7 +17,6 @@ trait Component {
 
   trait AbstractReport {
     def emit(): Unit
-    def emitJson(): JValue
   }
 
   def apply(units: List[xt.UnitDef], program: Program { val trees: xt.type }): Report
@@ -46,20 +43,17 @@ trait SimpleComponent extends Component { self =>
       (l, r) => l.lowering andThen r
     }
 
-    extraction.extract(program).transform(lowering)
+    program.transform(extraction.extractor andThen lowering)
   }
 
   def apply(units: List[xt.UnitDef], program: Program { val trees: xt.type }): Report = {
     val extracted = extract(program)
     import extracted._
 
-    val relevant = symbols.functions.values.filterNot { fd =>
-      (fd.flags contains "library") || (fd.flags contains "unchecked")
-    }.map(_.id).toSeq
-
+    val nonLibrary = symbols.functions.values.filterNot(_.flags contains "library").map(_.id).toSeq
     val functions = ctx.options.findOption(optFunctions) match {
-      case Some(names) => relevant.filter(id => names contains id.name)
-      case None => relevant
+      case Some(names) => nonLibrary.filter(id => names contains id.name)
+      case None => nonLibrary
     }
 
     apply(functions, extracted)

@@ -6,15 +6,15 @@ package ast
 import scala.reflect._
 import scala.collection.mutable.{Map => MutableMap}
 
+import scala.language.dynamics
+
 trait Definitions extends inox.ast.Definitions { self: Trees =>
 
   case object Extern extends Flag("extern", Seq.empty)
-  case object Unchecked extends Flag("unchecked", Seq.empty)
   case class Derived(id: Identifier) extends Flag("derived", Seq(id))
 
   override def extractFlag(name: String, args: Seq[Any]): Flag = (name, args) match {
     case ("extern", Seq()) => Extern
-    case ("unchecked", Seq()) => Unchecked
     case _ => super.extractFlag(name, args)
   }
 
@@ -70,15 +70,15 @@ trait Definitions extends inox.ast.Definitions { self: Trees =>
   }
 
   implicit class StainlessTypedFunDef(tfd: TypedFunDef) {
-    @inline def precondition: Option[Expr] = tfd.symbols.getPrecondition(tfd)
-    @inline def hasPrecondition: Boolean = precondition.isDefined
-    @inline def precOrTrue: Expr = precondition.getOrElse(BooleanLiteral(true))
+    @inline def precondition(implicit s: Symbols): Option[Expr] = s.getPrecondition(tfd)
+    @inline def hasPrecondition(implicit s: Symbols): Boolean = precondition.isDefined
+    @inline def precOrTrue(implicit s: Symbols): Expr = precondition.getOrElse(BooleanLiteral(true))
 
-    @inline def body: Option[Expr] = tfd.symbols.getBody(tfd)
+    @inline def body(implicit s: Symbols): Option[Expr] = s.getBody(tfd)
 
-    @inline def postcondition: Option[Expr] = tfd.symbols.getPostcondition(tfd)
-    @inline def hasPostcondition: Boolean = postcondition.isDefined
-    @inline def postOrTrue: Expr = postcondition.getOrElse {
+    @inline def postcondition(implicit s: Symbols): Option[Expr] = s.getPostcondition(tfd)
+    @inline def hasPostcondition(implicit s: Symbols): Boolean = postcondition.isDefined
+    @inline def postOrTrue(implicit s: Symbols): Expr = postcondition.getOrElse {
       Lambda(Seq(ValDef(FreshIdentifier("res", true), tfd.returnType)), BooleanLiteral(true))
     }
   }

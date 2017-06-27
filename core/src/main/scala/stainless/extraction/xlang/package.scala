@@ -5,14 +5,12 @@ package extraction
 
 package object xlang {
 
-  object trees extends xlang.Trees with oo.ClassSymbols {
+  object trees extends xlang.Trees with oo.ObjectSymbols {
     case class Symbols(
       functions: Map[Identifier, FunDef],
       adts: Map[Identifier, ADTDefinition],
       classes: Map[Identifier, ClassDef]
-    ) extends ClassSymbols with AbstractSymbols
-
-    object printer extends Printer { val trees: xlang.trees.type = xlang.trees }
+    ) extends ObjectSymbols with AbstractSymbols
   }
 
   /** As `xlang.Trees` don't extend the supported ASTs, the transformation from
@@ -40,9 +38,10 @@ package object xlang {
     def transformClass(cd: s.ClassDef): t.ClassDef = new t.ClassDef(
       cd.id,
       cd.tparams.map(tdef => transformer.transform(tdef)),
-      cd.parents.map(ct => transformer.transform(ct).asInstanceOf[t.ClassType]),
+      cd.parent,
       cd.fields.map(vd => transformer.transform(vd)),
+      cd.methods,
       (cd.flags - s.Ignore).map(f => transformer.transform(f))
-    ).copiedFrom(cd)
+    )
   }
 }

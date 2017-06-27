@@ -34,34 +34,6 @@ trait ImperativeCodeElimination extends inox.ast.SymbolTransformer {
     def toFunction(expr: Expr)(implicit state: State): (Expr, Expr => Expr, Map[Variable, Variable]) = {
       import state._
       expr match {
-        // Desugar Boolean bitwise operations &, | and ^; not actually tided to the overall transformation.
-        case BoolBitwiseAnd(lhs, rhs) =>
-          val l = ValDef(FreshIdentifier("lhs"), lhs.getType).copiedFrom(lhs)
-          val r = ValDef(FreshIdentifier("rhs"), rhs.getType).copiedFrom(rhs)
-          toFunction(
-            Let(l, lhs,
-              Let(r, rhs,
-                And(l.toVariable, r.toVariable)))
-          )
-
-        case BoolBitwiseOr(lhs, rhs) =>
-          val l = ValDef(FreshIdentifier("lhs"), lhs.getType).copiedFrom(lhs)
-          val r = ValDef(FreshIdentifier("rhs"), rhs.getType).copiedFrom(rhs)
-          toFunction(
-            Let(l, lhs,
-              Let(r, rhs,
-                Or(l.toVariable, r.toVariable)))
-          )
-
-        case BoolBitwiseXor(lhs, rhs) =>
-          val l = ValDef(FreshIdentifier("lhs"), lhs.getType).copiedFrom(lhs)
-          val r = ValDef(FreshIdentifier("rhs"), rhs.getType).copiedFrom(rhs)
-          toFunction(
-            Let(l, lhs,
-              Let(r, rhs,
-                Not(Equals(l.toVariable, r.toVariable))))
-          )
-
         case LetVar(vd, e, b) =>
           val newVd = vd.freshen
           val (rhsVal, rhsScope, rhsFun) = toFunction(e)
@@ -69,7 +41,7 @@ trait ImperativeCodeElimination extends inox.ast.SymbolTransformer {
           val newSubst = rhsFun + (vd.toVariable -> newVd.toVariable)
           val scope = (body: Expr) => rhsScope(Let(newVd, rhsVal, replaceFromSymbols(newSubst, bodyScope(body))).copiedFrom(expr))
           (bodyRes, scope, newSubst ++ bodyFun)
-
+   
         case Assignment(v, e) =>
           assert(varsInScope.contains(v))
           val newVd = v.toVal.freshen
@@ -146,7 +118,7 @@ trait ImperativeCodeElimination extends inox.ast.SymbolTransformer {
           }
 
           (res.toVariable, scope, scrutFun ++ (modifiedVars zip freshVars))
-
+   
         case wh @ While(cond, body, optInv) =>
           val name = ValDef(
             FreshIdentifier(parent.id.name + "While").setPos(parent.id),
@@ -155,7 +127,7 @@ trait ImperativeCodeElimination extends inox.ast.SymbolTransformer {
           )
 
           val newBody = Some(IfExpr(cond,
-            Block(Seq(body), ApplyLetRec(name.toVariable, Seq(), Seq(), Seq()).copiedFrom(wh)).copiedFrom(wh),
+            Block(Seq(body), ApplyLetRec(name.toVariable, Seq(), Seq()).copiedFrom(wh)).copiedFrom(wh),
             UnitLiteral().copiedFrom(wh)).copiedFrom(wh))
           val newPost = Some(Lambda(
             Seq(ValDef(FreshIdentifier("bodyRes"), UnitType, Set.empty).copiedFrom(wh)),
@@ -163,7 +135,7 @@ trait ImperativeCodeElimination extends inox.ast.SymbolTransformer {
           ).copiedFrom(wh))
 
           val fullBody = Lambda(Seq.empty, reconstructSpecs(optInv, newBody, newPost, UnitType)).copiedFrom(wh)
-          val newExpr = LetRec(Seq(LocalFunDef(name, Seq(), fullBody)), ApplyLetRec(name.toVariable, Seq(), Seq(), Seq()).setPos(wh)).setPos(wh)
+          val newExpr = LetRec(Seq(LocalFunDef(name, Seq(), fullBody)), ApplyLetRec(name.toVariable, Seq(), Seq()).setPos(wh)).setPos(wh)
           toFunction(newExpr)
 
         case Block(Seq(), expr) =>
@@ -175,9 +147,9 @@ trait ImperativeCodeElimination extends inox.ast.SymbolTransformer {
             val (rVal, rScope, rFun) = toFunction(e)
             val scope = (body: Expr) => rVal match {
               case fi: FunctionInvocation =>
-                rScope(replaceFromSymbols(rFun, Let(ValDef(FreshIdentifier("tmp"), fi.tfd.returnType, Set.empty).copiedFrom(body), rVal, accScope(body)).copiedFrom(body)))
+                rScope(replaceFromSymbols(rFun, Let(ValDef(FreshIdentifier("tmp"), fi.tfd.returnType, Set.empty), rVal, accScope(body))))
               case alr: ApplyLetRec =>
-                rScope(replaceFromSymbols(rFun, Let(ValDef(FreshIdentifier("tmp"), alr.getType, Set.empty).copiedFrom(body), rVal, accScope(body)).copiedFrom(body)))
+                rScope(replaceFromSymbols(rFun, Let(ValDef(FreshIdentifier("tmp"), alr.getType, Set.empty), rVal, accScope(body))))
               case _ =>
                 rScope(replaceFromSymbols(rFun, accScope(body)))
             }
@@ -203,7 +175,7 @@ trait ImperativeCodeElimination extends inox.ast.SymbolTransformer {
           )
 
         //a function invocation can update variables in scope.
-        case alr @ ApplyLetRec(fun, tparams, tps, args) if localsMapping contains fun =>
+        case alr @ ApplyLetRec(fun, tparams, args) if localsMapping contains fun =>
           val (recArgs, argScope, argFun) = args.foldRight((Seq[Expr](), (body: Expr) => body, Map[Variable, Variable]())) { (arg, acc) =>
             val (accArgs, accScope, accFun) = acc
             val (argVal, argScope, argFun) = toFunction(arg)
@@ -215,7 +187,7 @@ trait ImperativeCodeElimination extends inox.ast.SymbolTransformer {
           val newReturnType = TupleType(fun.tpe.asInstanceOf[FunctionType].to +: modifiedVars.map(_.tpe))
           val newInvoc = ApplyLetRec(
             fun.copy(tpe = FunctionType(recArgs.map(_.getType) ++ modifiedVars.map(_.tpe), newReturnType)),
-            tparams, tps, recArgs ++ modifiedVars
+            tparams, recArgs ++ modifiedVars
           ).setPos(alr)
 
           val freshVars = modifiedVars.map(_.freshen)
@@ -236,14 +208,14 @@ trait ImperativeCodeElimination extends inox.ast.SymbolTransformer {
 
         case LetRec(Seq(fd), b) =>
           val inner = Inner(fd)
-          val (pre, body, post) = breakDownSpecs(inner.fullBody)
+          val (pre, body, post) = breakDownSpecs(inner.body)
 
           def fdWithoutSideEffects = {
             val newBody = body.map { bd =>
               val (fdRes, fdScope, _) = toFunction(bd)
               fdScope(fdRes)
             }
-            val newFd = inner.copy(fullBody = reconstructSpecs(pre, newBody, post, inner.returnType))
+            val newFd = inner.copy(body = reconstructSpecs(pre, newBody, post, inner.returnType))
             val (bodyRes, bodyScope, bodyFun) = toFunction(b)
             (bodyRes, (b2: Expr) => LetRec(Seq(newFd.toLocal), bodyScope(b2)).setPos(fd).copiedFrom(expr), bodyFun)
           }
@@ -255,11 +227,11 @@ trait ImperativeCodeElimination extends inox.ast.SymbolTransformer {
               //returning it simplifies the code (more consistent) and should
               //not have a big impact on performance
               val modifiedVars: Seq[Variable] = {
-                val freeVars = variablesOf(inner.fullBody)
+                val freeVars = variablesOf(inner.body)
                 val transitiveVars = collect[Variable] {
-                  case ApplyLetRec(fun, _, _, _) => state.localsMapping.get(fun).map(p => p._2.toSet).getOrElse(Set())
+                  case ApplyLetRec(fun, _, _) => state.localsMapping.get(fun).map(p => p._2.toSet).getOrElse(Set())
                   case _ => Set()
-                } (inner.fullBody)
+                } (inner.body)
                 (freeVars ++ transitiveVars).intersect(state.varsInScope).toSeq
               }
 
@@ -323,7 +295,7 @@ trait ImperativeCodeElimination extends inox.ast.SymbolTransformer {
 
                 val newFd = inner.copy(
                   params = newParams,
-                  fullBody = reconstructSpecs(newPre, Some(newBody), newPost, newReturnType),
+                  body = reconstructSpecs(newPre, Some(newBody), newPost, newReturnType),
                   returnType = newReturnType
                 )
 
@@ -340,16 +312,8 @@ trait ImperativeCodeElimination extends inox.ast.SymbolTransformer {
 
         //TODO: handle vars in scope, just like LetRec
         case ld @ Lambda(params, body) =>
-          val (optPre, lBody) = body match {
-            case Require(pred, body) => (Some(pred), body)
-            case _ => (None, body)
-          }
-          val newPre = optPre.map { pre =>
-            val (res, scope, _) = toFunction(pre)
-            scope(res)
-          }
-          val (bodyVal, bodyScope, bodyFun) = toFunction(lBody)
-          (Lambda(params, withPrecondition(bodyScope(bodyVal), newPre)).copiedFrom(ld), (e: Expr) => e, Map())
+          val (bodyVal, bodyScope, bodyFun) = toFunction(body)
+          (Lambda(params, bodyScope(bodyVal)).copiedFrom(ld), (e: Expr) => e, Map())
 
         case c @ Choose(res, pred) =>
           //Recall that Choose cannot mutate variables from the scope

@@ -41,4 +41,4 @@ Papers
 Books
 *****
 
- - `Concrete Semantics with Isabelle/HOL <http://www.concrete-semantics.org/>`_, by *Tobias Nipkow* and *Gerwin Klein*.
+ - `Concrete Sematics with Isabelle/HOL <http://www.concrete-semantics.org/>`_, by *Tobias Nipkow* and *Gerwin Klein*.

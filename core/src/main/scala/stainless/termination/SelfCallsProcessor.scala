@@ -17,19 +17,14 @@ trait SelfCallsProcessor extends Processor {
 
   def run(problem: Problem) = {
     reporter.debug("- Self calls processor...")
-    val timer = ctx.timers.termination.processors.`self-calls`.start()
-
+    
     val nonTerminating = problem.funDefs
-      .filter(fd => alwaysCalls(fd.fullBody, fd.id))
+      .filter(fd => fd.body.isDefined && alwaysCalls(fd.body.get, fd.id))
 
-    val res = if (nonTerminating.nonEmpty) {
-      Some(nonTerminating.map(fd => Broken(fd, LoopsGivenInputs(name, fd.params.map(_.toVariable)))))
-    } else {
+    if (nonTerminating.nonEmpty)
+      Some(nonTerminating.map(fd => Broken(fd, fd.params.map(_.toVariable))))
+    else
       None
-    }
-
-    timer.stop()
-    res
   }
 
   private def alwaysCalls(expr: Expr, fid: Identifier): Boolean = {

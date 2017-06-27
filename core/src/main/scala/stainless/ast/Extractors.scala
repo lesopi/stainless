@@ -10,7 +10,7 @@ trait TreeDeconstructor extends inox.ast.TreeDeconstructor {
   def deconstruct(pattern: s.Pattern): (Seq[s.Variable], Seq[s.Expr], Seq[s.Type], Seq[s.Pattern], (Seq[t.Variable], Seq[t.Expr], Seq[t.Type], Seq[t.Pattern]) => t.Pattern) = pattern match {
     case s.InstanceOfPattern(binder, ct) =>
       (binder.map(_.toVariable).toSeq, Seq(), Seq(ct), Seq(), (vs, _, tps, _) => {
-        t.InstanceOfPattern(vs.headOption.map(_.toVal), tps.head)
+        t.InstanceOfPattern(vs.headOption.map(_.toVal), tps.head.asInstanceOf[t.ADTType])
       })
     case s.WildcardPattern(binder) =>
       (binder.map(_.toVariable).toSeq, Seq(), Seq(), Seq(), (vs, _, _, _) => {
@@ -138,7 +138,6 @@ trait TreeDeconstructor extends inox.ast.TreeDeconstructor {
 
   override def deconstruct(f: s.Flag): (Seq[s.Expr], Seq[s.Type], (Seq[t.Expr], Seq[t.Type]) => t.Flag) = f match {
     case s.Extern => (Seq(), Seq(), (_, _) => t.Extern)
-    case s.Unchecked => (Seq(), Seq(), (_, _) => t.Unchecked)
     case s.Derived(id) => (Seq(), Seq(), (_, _) => t.Derived(id))
     case _ => super.deconstruct(f)
   }

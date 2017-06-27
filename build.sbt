@@ -1,15 +1,7 @@
-
-val osInf = Option(System.getProperty("os.name")).getOrElse("")
-
-val isUnix    = osInf.indexOf("nix") >= 0 || osInf.indexOf("nux") >= 0
-val isWindows = osInf.indexOf("Win") >= 0
-val isMac     = osInf.indexOf("Mac") >= 0
-
-val osName = if (isWindows) "win" else if (isMac) "mac" else "unix"
+val osName = if (Option(System.getProperty("os.name")).getOrElse("").toLowerCase contains "win") "win" else "unix"
 val osArch = System.getProperty("sun.arch.data.model")
 
-val inoxVersion = "1.0.2-130-g3775bf8"
-val dottyVersion = "0.1.1-bin-20170429-10a2ce6-NIGHTLY"
+val inoxVersion = "1.0.2-2-gb5fdc3d"
 
 lazy val nParallel = {
   val p = System.getProperty("parallel")
@@ -26,20 +18,12 @@ lazy val nParallel = {
 
 lazy val frontendClass = settingKey[String]("The name of the compiler wrapper used to extract stainless trees")
 
-// FIXME @nv: dotty compiler needs the scala-library and dotty-library (and maybe some other
-//            dependencies?) so we set them here through stainless' compile-time dependencies.
-lazy val extraClasspath = taskKey[String]("Classpath extensions passed directly to the underlying compiler")
-
-lazy val scriptPath = taskKey[String]("Classpath used in the stainless Bash script")
-
 lazy val script = taskKey[Unit]("Generate the stainless Bash script")
-
-lazy val scalaVersionSetting: Setting[_] = scalaVersion := "2.11.8"
 
 lazy val artifactSettings: Seq[Setting[_]] = Seq(
   version := "0.1",
   organization := "ch.epfl.lara",
-  scalaVersionSetting
+  scalaVersion := "2.11.8"
 )
 
 lazy val commonSettings: Seq[Setting[_]] = artifactSettings ++ Seq(
@@ -62,15 +46,14 @@ lazy val commonSettings: Seq[Setting[_]] = artifactSettings ++ Seq(
   resolvers ++= Seq(
     "Sonatype OSS Snapshots" at "https://oss.sonatype.org/content/repositories/snapshots",
     "Sonatype OSS Releases" at "https://oss.sonatype.org/content/repositories/releases",
-    "uuverifiers" at "http://logicrunch.it.uu.se:4096/~wv/maven",
-    Resolver.typesafeIvyRepo("releases")
+    "uuverifiers" at "http://logicrunch.it.uu.se:4096/~wv/maven"
   ),
 
   libraryDependencies ++= Seq(
+    //"ch.epfl.lamp" %% "dotty" % "0.1-SNAPSHOT",
     "ch.epfl.lara" %% "inox" % inoxVersion,
     "ch.epfl.lara" %% "inox" % inoxVersion % "test" classifier "tests",
-    "org.scalatest" %% "scalatest" % "3.0.1" % "test",
-    "org.json4s" %% "json4s-native" % "3.5.2"
+    "org.scalatest" %% "scalatest" % "3.0.1" % "test"
   ),
 
   concurrentRestrictions in Global += Tags.limit(Tags.Test, nParallel),
@@ -84,24 +67,19 @@ lazy val commonSettings: Seq[Setting[_]] = artifactSettings ++ Seq(
   testOptions in IntegrationTest := Seq(Tests.Argument("-oDF"))
 )
 
-lazy val commonFrontendSettings: Seq[Setting[_]] = Defaults.itSettings ++ Seq(
+lazy val commonFrontendSettings: Seq[Setting[_]] = Seq(
   libraryDependencies ++= Seq(
     "ch.epfl.lara" %% "inox" % inoxVersion % "it" classifier "tests" classifier "it",
-    "org.scalatest" %% "scalatest" % "3.0.1" % "it" // FIXME: Does this override `% "test"` from commonSettings above?
+    "org.scalatest" %% "scalatest" % "3.0.1" % "it"  // FIXME: Does this override `% "test"` from commonSettings above?
   ),
 
-  /**
-    * NOTE: IntelliJ seems to have trouble including sources located outside the base directory of an
-    *   sbt project. You can temporarily disable the following four lines when importing the project.
-    */
-  unmanagedResourceDirectories in IntegrationTest += (root.base / "frontends" / "benchmarks"),
-  unmanagedSourceDirectories in Compile += (root.base.getAbsoluteFile / "frontends" / "common" / "src" / "main" / "scala"),
-  unmanagedSourceDirectories in Test += (root.base.getAbsoluteFile / "frontends" / "common" / "src" / "test" / "scala"),
-  unmanagedSourceDirectories in IntegrationTest += (root.base.getAbsoluteFile / "frontends" / "common" / "src" / "it" / "scala"),
-
-  sourceGenerators in Compile += Def.task {
+  sourceGenerators in Compile <+= Def.task {
     val libraryFiles = ((root.base / "frontends" / "library") ** "*.scala").getPaths
     val main = (sourceManaged in Compile).value / "stainless" / "Main.scala"
+    val extractFromSourceSig = """def extractFromSource(ctx: inox.Context, compilerOpts: List[String]): (
+                                 |    List[xt.UnitDef],
+                                 |    Program { val trees: xt.type }
+                                 |  )""".stripMargin
     IO.write(main, s"""|package stainless
                        |
                        |import extraction.xlang.{trees => xt}
@@ -116,17 +94,17 @@ lazy val commonFrontendSettings: Seq[Setting[_]] = Defaults.itSettings ++ Seq(
                        |  def extractFromSource(ctx: inox.Context, compilerOpts: List[String]): (
                        |    List[xt.UnitDef],
                        |    Program { val trees: xt.type }
-                       |  ) = frontends.${frontendClass.value}(ctx, List("-classpath", "${extraClasspath.value}") ++ compilerOpts)
+                       |  ) = frontends.${frontendClass.value}(ctx, compilerOpts)
                        |}""".stripMargin)
     Seq(main)
-  }) ++
-  inConfig(IntegrationTest)(Defaults.testTasks ++ Seq(
-    logBuffered := (nParallel > 1),
-    parallelExecution := (nParallel > 1)
-  ))
+  }
+) ++ Defaults.itSettings ++ inConfig(IntegrationTest)(Defaults.testTasks ++ Seq(
+  logBuffered := (nParallel > 1),
+  parallelExecution := (nParallel > 1)
+))
 
 val scriptSettings: Seq[Setting[_]] = Seq(
-  compile := (compile in Compile).dependsOn(script).value,
+  compile <<= (compile in Compile) dependsOn script,
 
   clean := {
     clean.value
@@ -134,22 +112,6 @@ val scriptSettings: Seq[Setting[_]] = Seq(
     if (scriptFile.exists && scriptFile.isFile) {
       scriptFile.delete
     }
-  },
-
-  scriptPath := {
-    val cps = (managedClasspath in Runtime).value ++
-      (unmanagedClasspath in Runtime).value ++
-      (internalDependencyClasspath in Runtime).value
-
-    val out = (classDirectory      in Compile).value
-    val res = (resourceDirectory   in Compile).value
-
-    (res.getAbsolutePath +: out.getAbsolutePath +: cps.map(_.data.absolutePath)).mkString(System.getProperty("path.separator"))
-  },
-
-  extraClasspath := {
-    ((classDirectory in Compile).value.getAbsolutePath +: (dependencyClasspath in Compile).value.map(_.data.absolutePath))
-      .mkString(System.getProperty("path.separator"))
   },
 
   script := {
@@ -160,6 +122,13 @@ val scriptSettings: Seq[Setting[_]] = Seq(
 
       val scriptFile = binDir / name.value
 
+      val cps = (managedClasspath in Runtime).value ++
+        (unmanagedClasspath in Runtime).value ++
+        (internalDependencyClasspath in Runtime).value
+
+      val out = (classDirectory      in Compile).value
+      val res = (resourceDirectory   in Compile).value
+
       if (scriptFile.exists) {
         s.log.info("Regenerating '" + scriptFile.getName + "' script")
         scriptFile.delete
@@ -167,14 +136,10 @@ val scriptSettings: Seq[Setting[_]] = Seq(
         s.log.info("Generating '" + scriptFile.getName + "' script")
       }
 
-      val paths = scriptPath.value
-      IO.write(scriptFile, s"""|#!/usr/bin/env bash
+      val paths = (res.getAbsolutePath +: out.getAbsolutePath +: cps.map(_.data.absolutePath)).mkString(System.getProperty("path.separator"))
+      IO.write(scriptFile, s"""|#!/bin/bash --posix
                                |
-                               |set -o posix
-                               |
-                               |set -o pipefail
-                               |
-                               |SCALACLASSPATH="$paths"
+                               |SCALACLASSPATH=$paths
                                |
                                |java -Xmx2G -Xms512M -Xss64M -classpath "$${SCALACLASSPATH}" -Dscala.usejavacp=true stainless.Main $$@ 2>&1 | tee -i last.log
                                |""".stripMargin)
@@ -190,7 +155,7 @@ val scriptSettings: Seq[Setting[_]] = Seq(
 def ghProject(repo: String, version: String) = RootProject(uri(s"${repo}#${version}"))
 
 //lazy val inox = RootProject(file("../inox"))
-//lazy val dotty = ghProject("git://github.com/lampepfl/dotty.git", "b3194406d8e1a28690faee12257b53f9dcf49506")
+lazy val dotty = ghProject("git://github.com/lampepfl/dotty.git", "fb1dbba5e35d1fc7c00250f597b8c796d8c96eda")
 lazy val cafebabe = ghProject("git://github.com/psuter/cafebabe.git", "49dce3c83450f5fa0b5e6151a537cc4b9f6a79a6")
 
 
@@ -204,7 +169,6 @@ lazy val `stainless-scalac` = (project in file("frontends/scalac"))
   .settings(
     name := "stainless-scalac",
     frontendClass := "scalac.ScalaCompiler",
-    extraClasspath := "", // no need for the classpath extension with scalac
     libraryDependencies += "org.scala-lang" % "scala-compiler" % scalaVersion.value)
   .dependsOn(`stainless-core`)
   //.dependsOn(inox % "test->test;it->test,it")
@@ -213,23 +177,24 @@ lazy val `stainless-scalac` = (project in file("frontends/scalac"))
 
 lazy val `stainless-dotty-frontend` = (project in file("frontends/dotty"))
   .settings(name := "stainless-dotty-frontend")
-  .dependsOn(`stainless-core`)
-  .settings(libraryDependencies += "ch.epfl.lamp" % "dotty_2.11" % dottyVersion % "provided")
+  .dependsOn(`stainless-core`, dotty % "provided")
   .settings(commonSettings)
 
 lazy val `stainless-dotty` = (project in file("frontends/stainless-dotty"))
   .settings(
     name := "stainless-dotty",
-    frontendClass := "dotc.DottyCompiler")
-  .dependsOn(`stainless-dotty-frontend`)
-  // Should truly depend on dotty, overriding the "provided" modifier above:
-  .settings(libraryDependencies += "ch.epfl.lamp" % "dotty_2.11" % dottyVersion)
+    frontendClass := "dotc.DottyCompiler",
+    /** 
+      * NOTE: IntelliJ seems to have trouble including sources located outside the base directory of an
+      *   sbt project. You can temporarily disable the following two lines when importing the project.
+      */
+    unmanagedResourceDirectories in IntegrationTest += file(".") / "frontends" / "scalac" / "it" / "resources")
+  .dependsOn(`stainless-dotty-frontend`, dotty)  // Should truly depend on dotty, overriding the "provided" modifier above
   .aggregate(`stainless-dotty-frontend`)
-  //.dependsOn(inox % "test->test;it->test,it")
   .configs(IntegrationTest)
   .settings(commonSettings, commonFrontendSettings, artifactSettings, scriptSettings)
 
 lazy val root = (project in file("."))
-  .settings(scalaVersionSetting, sourcesInBase in Compile := false)
+  .settings(sourcesInBase in Compile := false)
   .dependsOn(`stainless-scalac`, `stainless-dotty`)
   .aggregate(`stainless-core`, `stainless-scalac`, `stainless-dotty`)

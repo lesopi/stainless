@@ -3,9 +3,7 @@
 package stainless
 package ast
 
-trait Printer extends inox.ast.Printer {
-  protected val trees: Trees
-  import trees._
+trait Printers extends inox.ast.Printers { self: Trees =>
 
   override protected def ppBody(tree: Tree)(implicit ctx: PrinterContext): Unit = tree match {
     case NoTree(tpe) =>

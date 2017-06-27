@@ -11,33 +11,9 @@ trait RelationBuilder { self: Strengthener =>
   import checker.program.trees._
   import checker.program.symbols._
 
-  val cfa: CICFA { val program: checker.program.type }
-
   case class Relation(fd: FunDef, path: Path, call: FunctionInvocation, inLambda: Boolean) {
     override def toString : String = "Relation(" + fd.id + "," + path + ", " +
       call.tfd.id + call.args.mkString("(",",",")") + "," + inLambda + ")"
-
-    def compose(that: Relation): Relation = {
-      val tfd = call.tfd
-      val instPath = that.path.instantiate(tfd.tpSubst)
-      assert(that.fd == tfd.fd, "Cannot compose relations with incompatible functions")
-
-      val freeVars = instPath.variables -- tfd.params.map(_.toVariable).toSet
-      val freeSubst = (freeVars.map(_.toVal) zip freeVars.map(_.freshen)).toMap
-
-      val freshParams = tfd.params.map(_.freshen)
-      val paramPath = Path.empty withBindings (freshParams zip call.args)
-      val subst: Map[ValDef, Expr] = (tfd.params zip freshParams.map(_.toVariable)).toMap
-
-      val freshBindings = instPath.bound.map(vd => vd.freshen)
-      val freshSubst = (instPath.bound zip freshBindings).toMap
-      val newSubst = subst ++ freshSubst.mapValues(_.toVariable) ++ freeSubst
-      val newPath = instPath.map(freshSubst, exprOps.replaceFromSymbols(newSubst, _))
-
-      val newCall = exprOps.replaceFromSymbols(newSubst, tfd.instantiate(that.call)).asInstanceOf[FunctionInvocation]
-
-      Relation(fd, path merge paramPath merge newPath, newCall, inLambda || that.inLambda)
-    }
   }
 
   protected type RelationSignature = (FunDef, Expr, Boolean, Set[(FunDef, Boolean)])
@@ -52,8 +28,6 @@ trait RelationBuilder { self: Strengthener =>
   def getRelations(funDef: FunDef): Set[Relation] = relationCache.get(funDef) match {
     case Some((relations, signature)) if signature == funDefRelationSignature(funDef) => relations
     case _ => {
-      val analysis = cfa.analyze(funDef.id)
-
       object collector extends CollectorWithPC {
         type Result = Relation
         val trees: self.checker.program.trees.type = self.checker.program.trees
@@ -72,16 +46,12 @@ trait RelationBuilder { self: Strengthener =>
               rec(arg, path withCond self.applicationConstraint(funDef, id, arg, args))
             })
 
-          case l: Lambda =>
-            if (analysis.isApplied(l)) {
-              val old = inLambda
-              inLambda = true
-              val res = super.rec(e, path)
-              inLambda = old
-              res
-            } else {
-              l
-            }
+          case _: Lambda =>
+            val old = inLambda
+            inLambda = true
+            val res = super.rec(e, path)
+            inLambda = old
+            res
 
           case _ =>
             super.rec(e, path)

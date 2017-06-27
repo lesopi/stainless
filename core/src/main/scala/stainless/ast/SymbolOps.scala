@@ -14,14 +14,7 @@ trait SymbolOps extends inox.ast.SymbolOps { self: TypeOps =>
   import trees.exprOps._
   import symbols._
 
-  override lazy val simplifier = new transformers.SimplifierWithPC {
-    val trees: self.trees.type = self.trees
-    val symbols: self.symbols.type = self.symbols
-    // @nv: note that we need this to be a def! (see ionx.ast.SymbolOps.simplifier)
-    def initEnv = CNFPath.empty
-  }
-
-  override def isImpureExpr(expr: Expr): Boolean = expr match {
+  override protected def isImpureExpr(expr: Expr): Boolean = expr match {
     case (_: Require) | (_: Ensuring) | (_: Assert) => true
     case _ => super.isImpureExpr(expr)
   }
@@ -43,28 +36,26 @@ trait SymbolOps extends inox.ast.SymbolOps { self: TypeOps =>
     *
     * @see [[purescala.Expressions.Pattern]]
     */
-  def conditionForPattern[P <: PathLike[P]](in: Expr, pattern: Pattern, includeBinders: Boolean = false)
-                                           (implicit pp: PathProvider[P]): P = {
-
-    def bind(ob: Option[ValDef], to: Expr): P = {
+  def conditionForPattern(in: Expr, pattern: Pattern, includeBinders: Boolean = false): Path = {
+    def bind(ob: Option[ValDef], to: Expr): Path = {
       if (!includeBinders) {
-        pp.empty
+        Path.empty
       } else {
-        ob.map(vd => pp.empty withBinding (vd -> to)).getOrElse(pp.empty)
+        ob.map(vd => Path.empty withBinding (vd -> to)).getOrElse(Path.empty)
       }
     }
 
-    def rec(in: Expr, pattern: Pattern): P = {
+    def rec(in: Expr, pattern: Pattern): Path = {
       pattern match {
         case WildcardPattern(ob) =>
           bind(ob, in)
 
         case InstanceOfPattern(ob, adt) =>
-          val tadt = adt.asInstanceOf[ADTType].getADT
+          val tadt = adt.getADT
           if (tadt.root == tadt) {
             bind(ob, in)
           } else {
-            pp.empty withCond isInstOf(in, adt) merge bind(ob, in)
+            Path(isInstOf(in, adt)) merge bind(ob, in)
           }
 
         case ADTPattern(ob, adt, subps) =>
@@ -72,7 +63,7 @@ trait SymbolOps extends inox.ast.SymbolOps { self: TypeOps =>
           assert(tcons.fields.size == subps.size)
           val pairs = tcons.fields zip subps
           val subTests = pairs.map(p => rec(adtSelector(asInstOf(in, adt), p._1.id), p._2))
-          pp.empty withCond isInstOf(in, adt) merge bind(ob, asInstOf(in, adt)) merge subTests
+          Path(isInstOf(in, adt)) merge bind(ob, asInstOf(in, adt)) merge subTests
 
         case TuplePattern(ob, subps) =>
           val TupleType(tpes) = in.getType
@@ -85,7 +76,7 @@ trait SymbolOps extends inox.ast.SymbolOps { self: TypeOps =>
           bind(ob, in) withCond up.isSome(in) merge subs
 
         case LiteralPattern(ob, lit) =>
-          pp.empty withCond Equals(in, lit) merge bind(ob, in)
+          Path(Equals(in, lit)) merge bind(ob, in)
       }
     }
 
@@ -121,7 +112,7 @@ trait SymbolOps extends inox.ast.SymbolOps { self: TypeOps =>
           case (e, p) => mapForPattern(e, p)
         }.toMap
 
-      case InstanceOfPattern(b, adt: ADTType) =>
+      case InstanceOfPattern(b, adt) =>
         bindIn(b, Some(adt))
 
       case other =>
@@ -140,7 +131,7 @@ trait SymbolOps extends inox.ast.SymbolOps { self: TypeOps =>
 
         val condsAndRhs = for (cse <- cases) yield {
           val map = mapForPattern(scrut, cse.pattern)
-          val patCond = conditionForPattern[Path](scrut, cse.pattern, includeBinders = false)
+          val patCond = conditionForPattern(scrut, cse.pattern, includeBinders = false)
           val realCond = cse.optGuard match {
             case Some(g) => patCond withCond replaceFromSymbols(map, g)
             case None => patCond
@@ -180,17 +171,17 @@ trait SymbolOps extends inox.ast.SymbolOps { self: TypeOps =>
     * @see [[purescala.ExprOps#conditionForPattern conditionForPattern]]
     * @see [[purescala.ExprOps#mapForPattern mapForPattern]]
     */
-  def matchExprCaseConditions[P <: PathLike[P] : PathProvider](m: MatchExpr, path: P) : Seq[P] = {
+  def matchExprCaseConditions(m: MatchExpr, path: Path) : Seq[Path] = {
     val MatchExpr(scrut, cases) = m
     var pcSoFar = path
 
     for (c <- cases) yield {
       val g = c.optGuard getOrElse BooleanLiteral(true)
-      val cond = conditionForPattern[P](scrut, c.pattern, includeBinders = true)
+      val cond = conditionForPattern(scrut, c.pattern, includeBinders = true)
       val localCond = pcSoFar merge (cond withCond g)
 
       // These contain no binders defined in this MatchCase
-      val condSafe = conditionForPattern[P](scrut, c.pattern)
+      val condSafe = conditionForPattern(scrut, c.pattern)
       val gSafe = replaceFromSymbols(mapForPattern(scrut, c.pattern), g)
       pcSoFar = pcSoFar merge (condSafe withCond gSafe).negate
 
@@ -199,9 +190,9 @@ trait SymbolOps extends inox.ast.SymbolOps { self: TypeOps =>
   }
 
   /** Condition to pass this match case, expressed w.r.t scrut only */
-  def matchCaseCondition[P <: PathLike[P] : PathProvider](scrut: Expr, c: MatchCase): P = {
+  def matchCaseCondition(scrut: Expr, c: MatchCase): Path = {
 
-    val patternC = conditionForPattern[P](scrut, c.pattern, includeBinders = false)
+    val patternC = conditionForPattern(scrut, c.pattern, includeBinders = false)
 
     c.optGuard match {
       case Some(g) =>
@@ -252,7 +243,7 @@ trait SymbolOps extends inox.ast.SymbolOps { self: TypeOps =>
   }
 
   def ensur(e: Expr, pred: Expr) = {
-    Ensuring(e, tupleWrapArg(pred).asInstanceOf[Lambda]).setPos(e)
+    Ensuring(e, tupleWrapArg(pred).asInstanceOf[Lambda])
   }
 
   def funRequires(f: Expr, p: Expr) = {
@@ -315,16 +306,11 @@ trait SymbolOps extends inox.ast.SymbolOps { self: TypeOps =>
    * Weakest precondition
    * ==================== */
 
-  /**
-   * [[strict]] enable the strict arithmetic mode. See [[AssertionInjector.optStrictkArithmetic]].
-   * Overload with context below.
-   */
-  def weakestPrecondition(e: Expr, strict: Boolean): Expr = {
+  def weakestPrecondition(e: Expr): Expr = {
     object injector extends verification.AssertionInjector {
       val s: trees.type = trees
       val t: trees.type = trees
       val symbols: self.symbols.type = self.symbols
-      val strictArithmetic: Boolean = strict
     }
 
     val withAssertions = injector.transform(e)
@@ -362,8 +348,4 @@ trait SymbolOps extends inox.ast.SymbolOps { self: TypeOps =>
     val conditions = collector.collect(withAssertions)
     andJoin(conditions)
   }
-
-  def weakestPrecondition(e: Expr)(implicit ctx: inox.Context): Expr =
-    weakestPrecondition(e, ctx.options.findOptionOrDefault(verification.VerificationComponent.optStrictArithmetic))
-
 }

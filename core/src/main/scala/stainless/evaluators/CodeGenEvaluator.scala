@@ -114,7 +114,7 @@ trait CodeGenEvaluator
       val res = e(model)
       timer.stop()
       res
-    }.getOrElse(EvaluationResults.EvaluatorError(s"Couldn't compile expression: $expr"))
+    }.getOrElse(EvaluationResults.EvaluatorError("Couldn't compile expression"))
   }
 
   private def compileExpr(expr: Expr, args: Seq[ValDef]): Option[CompiledExpression] = {
@@ -160,14 +160,13 @@ trait CodeGenEvaluator
 }
 
 object CodeGenEvaluator {
-  def apply(p: StainlessProgram, opts: inox.Options): DeterministicEvaluator { val program: p.type } = {
-    val split = FunctionSplitting(p, max = 5000)
-    EncodingEvaluator(p)(split)(new {
-      val program: split.targetProgram.type = split.targetProgram
+  def apply(p: StainlessProgram, opts: inox.Options): CodeGenEvaluator { val program: p.type } = {
+    new {
+      val program: p.type = p
       val options = opts
     } with CodeGenEvaluator {
-      lazy val semantics = split.targetProgram.getSemantics
-    })
+      lazy val semantics = p.getSemantics
+    }
   }
 
   def default(p: StainlessProgram) = apply(p, p.ctx.options)

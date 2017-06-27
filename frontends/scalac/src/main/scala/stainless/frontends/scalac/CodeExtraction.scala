@@ -21,7 +21,6 @@ trait CodeExtraction extends ASTExtractors {
   import scala.collection.immutable.Set
 
   lazy val reporter = self.ctx.reporter
-  implicit val debugSection = DebugSectionExtraction
 
   implicit def scalaPosToInoxPos(p: global.Position): inox.utils.Position = {
     if (p == NoPosition) {
@@ -75,10 +74,44 @@ trait CodeExtraction extends ASTExtractors {
       }
     }
 
+    private val symbolToTypeParams: MutableMap[Symbol, Seq[xt.TypeParameter]] = MutableMap.empty
+    private def getTypeParams(sym: Symbol): Seq[xt.TypeParameter] = {
+      val root: Symbol = {
+        def rec(sym: Symbol): Symbol = sym.tpe.parents.headOption match {
+          case Some(tpe) if ignoreClasses(tpe) => sym
+          case Some(TypeRef(_, parentSym, tps)) => rec(parentSym)
+          case _ => outOfSubsetError(sym.pos, "Unexpected parent type " + sym.tpe)
+        }
+        rec(sym)
+      }
+
+      symbolToTypeParams.get(root) match {
+        case Some(tparams) => tparams
+        case None =>
+          val tparams = root.tpe match {
+            case TypeRef(_, _, tps) => extractTypeParams(tps).map(sym => xt.TypeParameter.fresh(sym.name.toString))
+            case _ => Nil
+          }
+          symbolToTypeParams += root -> tparams
+          tparams
+      }
+    }
+
     private def annotationsOf(sym: Symbol, ignoreOwner: Boolean = false): Set[xt.Flag] = {
-      getAnnotations(sym, ignoreOwner).map { case (name, args) =>
-        xt.extractFlag(name, args.map(extractTree(_)(DefContext())))
-      }.toSet
+      val actualSymbol = sym.accessedOrSelf
+      (for {
+        a <- actualSymbol.annotations ++ (if (!ignoreOwner) actualSymbol.owner.annotations else Set.empty)
+        name = a.atp.safeToString.replaceAll("\\.package\\.", ".")
+      } yield {
+        if (name startsWith "stainless.annotation.") {
+          val shortName = name drop "stainless.annotation.".length
+          Some(xt.extractFlag(shortName, a.args.map(extractTree(_)(DefContext()))))
+        } else if (name == "inline") {
+          Some(xt.extractFlag(name, a.args.map(extractTree(_)(DefContext()))))
+        } else {
+          None
+        }
+      }).flatten.toSet
     }
 
     case class DefContext(
@@ -119,7 +152,7 @@ trait CodeExtraction extends ASTExtractors {
       }
     }
 
-    def extractProgram: (List[xt.UnitDef], Program { val trees: xt.type }) = try {
+    def extractProgram: (List[xt.UnitDef], Program { val trees: xt.type }) = {
       val unitsAcc     = new ListBuffer[xt.UnitDef]
       val classesAcc   = new ListBuffer[xt.ClassDef]
       val functionsAcc = new ListBuffer[xt.FunDef]
@@ -158,11 +191,6 @@ trait CodeExtraction extends ASTExtractors {
       }
 
       (unitsAcc.toList, program)
-    } catch {
-      case e: ImpureCodeEncounteredException =>
-        reporter.debug(s"Extraction failed because of:")
-        reporter.debug(e.pos, e.getMessage, e)
-        reporter.fatalError(e.pos, e.getMessage)
     }
 
     // This one never fails, on error, it returns Untyped
@@ -171,7 +199,7 @@ trait CodeExtraction extends ASTExtractors {
         extractType(tpt)
       } catch {
         case e: ImpureCodeEncounteredException =>
-          reporter.debug(e.pos, "[ignored] " + e.getMessage, e)
+          e.printStackTrace()
           xt.Untyped
       }
     }
@@ -196,10 +224,7 @@ trait CodeExtraction extends ASTExtractors {
         case EmptyTree =>
           // ignore
 
-        case t if (
-          (annotationsOf(t.symbol) contains xt.Ignore) ||
-          (t.symbol.isSynthetic && !t.symbol.isImplicit)
-        ) =>
+        case t if (annotationsOf(t.symbol) contains xt.Ignore) || (t.symbol.isSynthetic) =>
           // ignore
 
         case ExtractorHelpers.ExSymbol("stainless", "annotation", "ignore") =>
@@ -239,9 +264,6 @@ trait CodeExtraction extends ASTExtractors {
           val fd = extractFunction(fsym, Seq.empty, Seq.empty, rhs)(DefContext())
           functions :+= fd.id
           allFunctions :+= fd
-
-        case t if t.symbol.isSynthetic =>
-          // ignore
 
         case other =>
           reporter.warning(other.pos, "Could not extract tree in static container: " + other)
@@ -293,32 +315,29 @@ trait CodeExtraction extends ASTExtractors {
       val sym = cd.symbol
       val id = getIdentifier(sym)
 
+      val parent = sym.tpe.parents.headOption match {
+        case Some(tpe) if ignoreClasses(tpe) => None
+        case Some(TypeRef(_, parentSym, tps)) => Some(getIdentifier(parentSym))
+        case _ => None
+      }
+
+      val tparams = getTypeParams(sym)
+
       val tparamsSyms = sym.tpe match {
-        case TypeRef(_, _, tps) => typeParamSymbols(tps)
+        case TypeRef(_, _, tps) => extractTypeParams(tps)
         case _ => Nil
       }
 
-      val tparams = extractTypeParams(tparamsSyms)
-
       val tpCtx = DefContext((tparamsSyms zip tparams).toMap)
 
-      val parents = cd.impl.parents.flatMap(p => p.tpe match {
-        case tpe if ignoreClasses(tpe) => None
-        case tp @ TypeRef(_, _, _) => Some(extractType(tp)(tpCtx, p.pos).asInstanceOf[xt.ClassType])
-        case _ => None
-      })
+      val flags = annotationsOf(sym) ++ (if (sym.isAbstractClass) Some(xt.IsAbstract) else None)
 
-      val annots = annotationsOf(sym)
-      val flags = annots ++
-        (if (sym.isAbstractClass) Some(xt.IsAbstract) else None) ++
-        (if (sym.isSealed) Some(xt.IsSealed) else None)
-
-      val constructorOpt = cd.impl.children.find {
+      val constructor = cd.impl.children.find {
         case ExConstructorDef() => true
         case _ => false
-      }.asInstanceOf[Option[DefDef]]
+      }.get.asInstanceOf[DefDef]
 
-      val vds = constructorOpt map { _.vparamss.flatten } getOrElse Seq()
+      val vds = constructor.vparamss.flatten
       val symbols = cd.impl.children.collect {
         case df @ DefDef(_, name, _, _, _, _)
         if df.symbol.isAccessor && df.symbol.isParamAccessor && !name.endsWith("_$eq") => df.symbol
@@ -341,10 +360,7 @@ trait CodeExtraction extends ASTExtractors {
         case EmptyTree =>
           // ignore
 
-        case t if (
-          (annotationsOf(t.symbol) contains xt.Ignore) ||
-          (t.symbol.isSynthetic && !t.symbol.isImplicit)
-        ) =>
+        case t if (annotationsOf(t.symbol) contains xt.Ignore) || (t.symbol.isSynthetic) =>
           // ignore
 
         case ExRequiredExpression(body) =>
@@ -371,7 +387,7 @@ trait CodeExtraction extends ASTExtractors {
         case ValDef(_, _, _, _) =>
           // ignore (corresponds to constructor fields)
 
-        case d if d.symbol.isSynthetic =>
+        case d if (d.symbol.isImplicit && d.symbol.isSynthetic) =>
           // ignore
 
         case d if d.symbol.isVar =>
@@ -381,22 +397,21 @@ trait CodeExtraction extends ASTExtractors {
           reporter.warning(other.pos, "Could not extract tree in class: " + other + " (" + other.getClass + ")")
       }
 
-      val optInv = if (invariants.isEmpty) None else Some({
-        val fd = new xt.FunDef(SymbolIdentifier(invSymbol), Seq.empty, Seq.empty, xt.BooleanType,
+      val optInv = if (invariants.isEmpty) None else Some(
+        new xt.FunDef(SymbolIdentifier(invSymbol), Seq.empty, Seq.empty, xt.BooleanType,
           if (invariants.size == 1) invariants.head else xt.And(invariants),
-          Set(xt.IsInvariant) ++ annots
+          Set(xt.IsInvariant) ++ flags
         )
-        fd.setPos(inox.utils.Position.between(invariants.head.getPos, invariants.last.getPos))
-        fd
-      })
+      )
 
-      val allMethods = (methods ++ optInv).map(fd => fd.copy(flags = fd.flags + xt.IsMethodOf(id)))
+      val allMethods = (methods ++ optInv).map(fd => fd.copy(flags = fd.flags + xt.IsMethod))
 
       val xcd = new xt.ClassDef(
         id,
         tparams.map(tp => xt.TypeParameterDef(tp)),
-        parents,
+        parent,
         fields,
+        allMethods.map(_.id.asInstanceOf[SymbolIdentifier]),
         flags
       ).setPos(sym.pos)
 
@@ -446,8 +461,8 @@ trait CodeExtraction extends ASTExtractors {
     )(implicit dctx: DefContext): xt.FunDef = {
 
       // Type params of the function itself
-      val extparams = typeParamSymbols(sym.typeParams.map(_.tpe))
-      val ntparams = typeParams.getOrElse(extractTypeParams(extparams))
+      val extparams = extractTypeParams(sym.typeParams.map(_.tpe))
+      val ntparams = typeParams.getOrElse(extparams.map(sym => xt.TypeParameter.fresh(sym.name.toString)))
 
       val nctx = dctx.copy(tparams = dctx.tparams ++ (extparams zip ntparams).toMap)
 
@@ -463,8 +478,8 @@ trait CodeExtraction extends ASTExtractors {
       val id = getIdentifier(sym)
 
       var flags = annotationsOf(sym).toSet ++
-        (if (sym.isImplicit) Set(xt.Inline, xt.Implicit) else Set()) ++
-        (if (sym.isAccessor) Set(xt.IsField(sym.isLazy)) else Set())
+        (if (sym.isImplicit) Some(xt.Inline) else None) ++
+        (if (sym.isAccessor) Some(xt.IsField(sym.isLazy)) else None)
 
       val body =
         if (!(flags contains xt.IsField(true))) rhs
@@ -484,9 +499,16 @@ trait CodeExtraction extends ASTExtractors {
 
       val finalBody = if (rhs == EmptyTree) {
         flags += xt.IsAbstract
-        xt.NoTree(returnType).setPos(sym.pos)
-      } else {
+        xt.NoTree(returnType)
+      } else try {
         xt.exprOps.flattenBlocks(extractTreeOrNoTree(body)(fctx))
+      } catch {
+        case e: ImpureCodeEncounteredException =>
+          reporter.error(e.pos, e.getMessage)
+          e.printStackTrace()
+
+          flags += xt.IsAbstract
+          xt.NoTree(returnType)
       }
 
       val fullBody = if (fctx.isExtern) {
@@ -505,17 +527,12 @@ trait CodeExtraction extends ASTExtractors {
       ).setPos(sym.pos)
     }
 
-    private def typeParamSymbols(tps: Seq[Type]): Seq[Symbol] = tps.flatMap {
+    private def extractTypeParams(tps: Seq[Type]): Seq[Symbol] = tps.flatMap {
       case TypeRef(_, sym, Nil) =>
         Some(sym)
       case t =>
         outOfSubsetError(t.typeSymbol.pos, "Unhandled type for parameter: "+t)
         None
-    }
-
-    private def extractTypeParams(syms: Seq[Symbol]): Seq[xt.TypeParameter] = syms.map { sym =>
-      val variance = if (sym.isCovariant) Some(xt.Variance(true)) else if (sym.isContravariant) Some(xt.Variance(false)) else None
-      xt.TypeParameter(FreshIdentifier(sym.name.toString), variance.toSet)
     }
 
     private def extractPattern(p: Tree, binder: Option[xt.ValDef] = None)(implicit dctx: DefContext): (xt.Pattern, DefContext) = p match {
@@ -545,7 +562,7 @@ trait CodeExtraction extends ASTExtractors {
         // case Obj =>
         extractType(s) match {
           case ct: xt.ClassType =>
-            (xt.ClassPattern(binder, ct, Seq()).setPos(p.pos), dctx)
+            (xt.ADTPattern(binder, ct, Seq()).setPos(p.pos), dctx)
           case _ =>
             outOfSubsetError(s, "Invalid type "+s.tpe+" for .isInstanceOf")
         }
@@ -555,7 +572,7 @@ trait CodeExtraction extends ASTExtractors {
           case ct: xt.ClassType =>
             val (subPatterns, subDctx) = args.map(extractPattern(_)).unzip
             val nctx = subDctx.foldLeft(dctx)(_ union _)
-            (xt.ClassPattern(binder, ct, subPatterns).setPos(p.pos), nctx)
+            (xt.ADTPattern(binder, ct, subPatterns).setPos(p.pos), nctx)
 
           case xt.TupleType(argsTpes) =>
             val (subPatterns, subDctx) = args.map(extractPattern(_)).unzip
@@ -570,10 +587,7 @@ trait CodeExtraction extends ASTExtractors {
         val lit = xt.IntegerLiteral(BigInt(n.value.stringValue))
         (xt.LiteralPattern(binder, lit), dctx)
 
-      case ExInt8Literal(i)    => (xt.LiteralPattern(binder, xt.Int8Literal(i)),    dctx)
-      case ExInt16Literal(i)   => (xt.LiteralPattern(binder, xt.Int16Literal(i)),   dctx)
-      case ExInt32Literal(i)   => (xt.LiteralPattern(binder, xt.Int32Literal(i)),   dctx)
-      case ExInt64Literal(i)   => (xt.LiteralPattern(binder, xt.Int64Literal(i)),   dctx)
+      case ExInt32Literal(i)   => (xt.LiteralPattern(binder, xt.IntLiteral(i)),     dctx)
       case ExBooleanLiteral(b) => (xt.LiteralPattern(binder, xt.BooleanLiteral(b)), dctx)
       case ExUnitLiteral()     => (xt.LiteralPattern(binder, xt.UnitLiteral()),     dctx)
       case ExStringLiteral(s)  => (xt.LiteralPattern(binder, xt.StringLiteral(s)),  dctx)
@@ -622,8 +636,8 @@ trait CodeExtraction extends ASTExtractors {
       val fctx = es.collect {
         case ExFunctionDef(sym, tparams, vparams, tpt, rhs) => (sym, tparams)
       }.foldLeft(dctx) { case (dctx, (sym, tparams)) =>
-        val extparams = typeParamSymbols(sym.typeParams.map(_.tpe))
-        val tparams = extractTypeParams(extparams)
+        val extparams = extractTypeParams(sym.typeParams.map(_.tpe))
+        val tparams = extparams.map(sym => xt.TypeParameter.fresh(sym.name.toString))
         val nctx = dctx.copy(tparams = dctx.tparams ++ (extparams zip tparams).toMap)
 
         val paramTypes = sym.info.paramss.flatten.map { sym =>
@@ -665,10 +679,10 @@ trait CodeExtraction extends ASTExtractors {
           val b   = rec(xs)
           xt.Require(pre, b).setPos(e.pos)
 
-        case (e @ ExDecreasesExpression(ranks)) :: xs =>
-          val rs = ranks.map(extractTree(_)(vctx))
+        case (e @ ExDecreasesExpression(rank)) :: xs =>
+          val r = extractTree(rank)(vctx)
           val b = rec(xs)
-          xt.Decreases(xt.tupleWrap(rs), b).setPos(e.pos)
+          xt.Decreases(r, b).setPos(e.pos)
 
         case (d @ ExFunctionDef(sym, tparams, vparams, tpt, rhs)) :: xs =>
           val (vd, tdefs) = vctx.localFuns(sym)
@@ -704,7 +718,7 @@ trait CodeExtraction extends ASTExtractors {
 
     private def extractArgs(sym: Symbol, args: Seq[Tree])(implicit dctx: DefContext): Seq[xt.Expr] = {
       (sym.paramLists.flatten zip args.map(extractTree)).map {
-        case (sym, e) => if (sym.isByNameParam) xt.Lambda(Seq.empty, e).setPos(e.getPos) else e
+        case (sym, e) => if (sym.isByNameParam) xt.Lambda(Seq.empty, e) else e
       }
     }
 
@@ -713,20 +727,17 @@ trait CodeExtraction extends ASTExtractors {
         val b = extractBlock(es :+ e)
         xt.exprOps.flattenBlocks(b)
 
-      case ExAssertExpression(e, oerr) =>
-        xt.Assert(extractTree(e), oerr, xt.UnitLiteral().setPos(tr.pos))
-
       case ExRequiredExpression(body) =>
         xt.Require(extractTree(body), xt.UnitLiteral().setPos(tr.pos))
 
       case ExEnsuredExpression(body, contract) =>
         val post = extractTree(contract)
         val b = extractTreeOrNoTree(body)
+        val tpe = extractType(body)
 
         val closure = post match {
           case l: xt.Lambda => l
           case other =>
-            val tpe = extractType(body)
             val vd = xt.ValDef(FreshIdentifier("res"), tpe, Set.empty).setPos(post)
             xt.Lambda(Seq(vd), extractType(contract) match {
               case xt.BooleanType => post
@@ -739,8 +750,7 @@ trait CodeExtraction extends ASTExtractors {
       case t @ ExHoldsWithProofExpression(body, ExMaybeBecauseExpressionWrapper(proof)) =>
         val vd = xt.ValDef(FreshIdentifier("holds"), xt.BooleanType, Set.empty).setPos(tr.pos)
         val p = extractTreeOrNoTree(proof)
-        val and = xt.And(p, vd.toVariable).setPos(tr.pos)
-        val post = xt.Lambda(Seq(vd), and).setPos(tr.pos)
+        val post = xt.Lambda(Seq(vd), xt.And(Seq(p, vd.toVariable))).setPos(tr.pos)
         val b = extractTreeOrNoTree(body)
         xt.Ensuring(b, post)
 
@@ -754,8 +764,7 @@ trait CodeExtraction extends ASTExtractors {
       case t @ ExBecauseExpression(ExHoldsExpression(body), proof) =>
         val vd = xt.ValDef(FreshIdentifier("holds"), xt.BooleanType, Set.empty).setPos(tr.pos)
         val p = extractTreeOrNoTree(proof)
-        val and = xt.And(p, vd.toVariable).setPos(tr.pos)
-        val post = xt.Lambda(Seq(vd), and).setPos(tr.pos)
+        val post = xt.Lambda(Seq(vd), xt.And(Seq(p, vd.toVariable))).setPos(tr.pos)
         val b = extractTreeOrNoTree(body)
         xt.Ensuring(b, post)
 
@@ -838,7 +847,7 @@ trait CodeExtraction extends ASTExtractors {
 
       case ExIntToBigInt(tree) =>
         extractTree(tree) match {
-          case xt.Int32Literal(n) => xt.IntegerLiteral(BigInt(n))
+          case xt.IntLiteral(n) => xt.IntegerLiteral(BigInt(n))
           case _ => outOfSubsetError(tr, "Conversion from Int to BigInt")
         }
 
@@ -854,26 +863,23 @@ trait CodeExtraction extends ASTExtractors {
           case _ => outOfSubsetError(tr, "Real not build from literals")
         }
 
-      case ExInt8Literal(v) => xt.Int8Literal(v)
-      case ExInt16Literal(v) => xt.Int16Literal(v)
-      case ExInt32Literal(v) => xt.Int32Literal(v)
-      case ExInt64Literal(v) => xt.Int64Literal(v)
+      case ExInt32Literal(v) => xt.IntLiteral(v)
       case ExBooleanLiteral(v) => xt.BooleanLiteral(v)
       case ExUnitLiteral() => xt.UnitLiteral()
       case ExCharLiteral(c) => xt.CharLiteral(c)
       case ExStringLiteral(s) => xt.StringLiteral(s)
 
-      case ExIdentity(body) => extractTree(body)
+      case ExLocally(body) => extractTree(body)
 
-      case ExTyped(e, _) => extractTree(e)
+      case ExTyped(e, _) =>
+        // TODO: refine type here?
+        extractTree(e)
 
       case ex @ ExIdentifier(sym, tpt) =>
         dctx.vars.get(sym).orElse(dctx.mutableVars.get(sym)) match {
           case Some(builder) => builder().setPos(ex.pos)
           case None => dctx.localFuns.get(sym) match {
-            case Some((vd, tparams)) =>
-              assert(tparams.isEmpty, "Unexpected application " + ex + " without type parameters")
-              xt.ApplyLetRec(vd.toVariable, Seq.empty, Seq.empty, Seq.empty)
+            case Some((vd, tparams)) => xt.ApplyLetRec(vd.toVariable, tparams.map(_.tp), Seq.empty)
             case None => xt.FunctionInvocation(getIdentifier(sym), Seq.empty, Seq.empty)
           }
         }
@@ -902,17 +908,17 @@ trait CodeExtraction extends ASTExtractors {
         val exBody = extractTree(body)(dctx.withNewVars(newVars))
         xt.Lambda(vds, exBody)
 
-      case ExForallExpression(contract) =>
-        extractTree(contract) match {
-          case l: xt.Lambda => xt.Forall(l.args, l.body).setPos(l)
-          case pred => extractType(contract) match {
-            case xt.FunctionType(from, to) =>
-              val args = from.map(tpe => xt.ValDef(FreshIdentifier("x", true), tpe).setPos(pred))
-              xt.Forall(args, xt.Application(pred, args.map(_.toVariable)).setPos(pred))
-            case _ => 
-              outOfSubsetError(tr, "Unsupported forall definition: " + tr)
-          }
+      case ExForallExpression(args, body) =>
+        val vds = args map { case (tpt, sym) =>
+          xt.ValDef(FreshIdentifier(sym.name.toString), extractType(tpt), annotationsOf(sym, ignoreOwner = true)).setPos(sym.pos)
         }
+
+        val newVars = (args zip vds).map { case ((_, sym), lvd) =>
+          sym -> (() => lvd.toVariable)
+        }
+
+        val exBody = extractTree(body)(dctx.withNewVars(newVars))
+        xt.Forall(vds, exBody)
 
       case ExFiniteMap(tptFrom, tptTo, args) =>
         val to = extractType(tptTo)
@@ -951,26 +957,26 @@ trait CodeExtraction extends ASTExtractors {
             (xt.TupleSelect(ex, 1), xt.TupleSelect(ex, 2))
         }, extractType(tpt))
 
-      case ExClassConstruction(tpt, args) =>
+      case ExCaseClassConstruction(tpt, args) =>
         extractType(tpt) match {
           case ct: xt.ClassType => xt.ClassConstructor(ct, args.map(extractTree))
           case _ => outOfSubsetError(tr, "Construction of a non-class type.")
         }
 
       case ExNot(e)        => xt.Not(extractTree(e))
-      case ExUMinus(e)     => injectCast(xt.UMinus)(e)
-      case ExBVNot(e)      => injectCast(xt.BVNot)(e)
+      case ExUMinus(e)     => xt.UMinus(extractTree(e))
+      case ExBVNot(e)      => xt.BVNot(extractTree(e))
 
       case ExNotEquals(l, r) => xt.Not(((extractTree(l), extractType(l), extractTree(r), extractType(r)) match {
-        case (bi @ xt.BVLiteral(_, _), _, e, xt.IntegerType) => xt.Equals(xt.IntegerLiteral(bi.toBigInt).setPos(l.pos), e)
-        case (e, xt.IntegerType, bi @ xt.BVLiteral(_, _), _) => xt.Equals(e, xt.IntegerLiteral(bi.toBigInt).setPos(r.pos))
-        case _ => injectCasts(xt.Equals)(l, r)
+        case (xt.IntLiteral(i), _, e, xt.IntegerType) => xt.Equals(xt.IntegerLiteral(i), e)
+        case (e, xt.IntegerType, xt.IntLiteral(i), _) => xt.Equals(e, xt.IntegerLiteral(i))
+        case (e1, _, e2, _) => xt.Equals(e1, e2)
       }).setPos(tr.pos))
 
       case ExEquals(l, r) => (extractTree(l), extractType(l), extractTree(r), extractType(r)) match {
-        case (bi @ xt.BVLiteral(_, _), _, e, xt.IntegerType) => xt.Equals(xt.IntegerLiteral(bi.toBigInt).setPos(l.pos), e)
-        case (e, xt.IntegerType, bi @ xt.BVLiteral(_, _), _) => xt.Equals(e, xt.IntegerLiteral(bi.toBigInt).setPos(r.pos))
-        case _ => injectCasts(xt.Equals)(l, r)
+        case (xt.IntLiteral(i), _, e, xt.IntegerType) => xt.Equals(xt.IntegerLiteral(i), e)
+        case (e, xt.IntegerType, xt.IntLiteral(i), _) => xt.Equals(e, xt.IntegerLiteral(i))
+        case (e1, _, e2, _) => xt.Equals(e1, e2)
       }
 
       case ExArrayFill(baseType, length, defaultValue) =>
@@ -1025,7 +1031,7 @@ trait CodeExtraction extends ASTExtractors {
             case None =>
               xt.FunctionInvocation(getIdentifier(sym), tps.map(extractType), extractArgs(sym, args))
             case Some((vd, tparams)) =>
-              xt.ApplyLetRec(vd.toVariable, tparams.map(_.tp), tps.map(extractType), extractArgs(sym, args))
+              xt.ApplyLetRec(vd.toVariable, tparams.map(_.tp), extractArgs(sym, args))
           }
 
         case Some(lhs) => extractType(lhs) match {
@@ -1053,7 +1059,7 @@ trait CodeExtraction extends ASTExtractors {
 
           case tpe => (tpe, sym.name.decode.toString, args) match {
             case (xt.StringType, "+", Seq(rhs)) => xt.StringConcat(extractTree(lhs), extractTree(rhs))
-            case (xt.IntegerType | xt.BVType(_) | xt.RealType, "+", Seq(rhs)) => injectCasts(xt.Plus)(lhs, rhs)
+            case (xt.IntegerType | xt.BVType(_) | xt.RealType, "+", Seq(rhs)) => xt.Plus(extractTree(lhs), extractTree(rhs))
 
             case (xt.SetType(_), "+",  Seq(rhs)) => xt.SetAdd(extractTree(lhs), extractTree(rhs))
             case (xt.SetType(_), "++", Seq(rhs)) => xt.SetUnion(extractTree(lhs), extractTree(rhs))
@@ -1061,7 +1067,6 @@ trait CodeExtraction extends ASTExtractors {
             case (xt.SetType(_), "--", Seq(rhs)) => xt.SetDifference(extractTree(lhs), extractTree(rhs))
             case (xt.SetType(_), "subsetOf", Seq(rhs)) => xt.SubsetOf(extractTree(lhs), extractTree(rhs))
             case (xt.SetType(_), "contains", Seq(rhs)) => xt.ElementOfSet(extractTree(rhs), extractTree(lhs))
-            case (xt.SetType(b), "-", Seq(rhs))  => xt.SetDifference(extractTree(lhs), xt.FiniteSet(Seq(extractTree(rhs)), b).setPos(tr.pos))
 
             case (xt.BagType(_), "+",   Seq(rhs)) => xt.BagAdd(extractTree(lhs), extractTree(rhs))
             case (xt.BagType(_), "++",  Seq(rhs)) => xt.BagUnion(extractTree(lhs), extractTree(rhs))
@@ -1084,7 +1089,7 @@ trait CodeExtraction extends ASTExtractors {
                 xt.IsInstanceOf(xt.MapApply(l, r).setPos(tr.pos), someTpe).setPos(tr.pos),
                 Some("Map undefined at this index"),
                 xt.ClassSelector(
-                  xt.AsInstanceOf(xt.MapApply(l, r).setPos(tr.pos), someTpe).setPos(tr.pos),
+                  xt.AsInstanceOf(xt.MapApply(l, r).setPos(tr.pos), someTpe),
                   getIdentifier(someSymbol.caseFieldAccessors.head)
                 ).setPos(tr.pos)
               )
@@ -1093,7 +1098,7 @@ trait CodeExtraction extends ASTExtractors {
               xt.Not(xt.Equals(
                 xt.MapApply(extractTree(lhs), extractTree(rhs)).setPos(tr.pos),
                 xt.ClassConstructor(
-                  xt.ClassType(getIdentifier(noneSymbol).setPos(tr.pos), Seq(to)).setPos(tr.pos),
+                  xt.ClassType(getIdentifier(noneSymbol).setPos(tr.pos), Seq(to)),
                   Seq()
                 ).setPos(tr.pos)
               ).setPos(tr.pos))
@@ -1135,56 +1140,25 @@ trait CodeExtraction extends ASTExtractors {
                 Seq(xt.Lambda(Seq(), extractTree(orElse)).setPos(tr.pos))
               )
 
-            case (_, "unary_+", Seq()) => injectCast(e => e)(lhs)
-            case (_, "-",   Seq(rhs)) => injectCasts(xt.Minus)(lhs, rhs)
-            case (_, "*",   Seq(rhs)) => injectCasts(xt.Times)(lhs, rhs)
-            case (_, "%",   Seq(rhs)) => injectCasts(xt.Remainder)(lhs, rhs)
+            case (_, "-",   Seq(rhs)) => xt.Minus(extractTree(lhs), extractTree(rhs))
+            case (_, "*",   Seq(rhs)) => xt.Times(extractTree(lhs), extractTree(rhs))
+            case (_, "%",   Seq(rhs)) => xt.Remainder(extractTree(lhs), extractTree(rhs))
             case (_, "mod", Seq(rhs)) => xt.Modulo(extractTree(lhs), extractTree(rhs))
-            case (_, "/",   Seq(rhs)) => injectCasts(xt.Division)(lhs, rhs)
-            case (_, ">",   Seq(rhs)) => injectCasts(xt.GreaterThan)(lhs, rhs)
-            case (_, ">=",  Seq(rhs)) => injectCasts(xt.GreaterEquals)(lhs, rhs)
-            case (_, "<",   Seq(rhs)) => injectCasts(xt.LessThan)(lhs, rhs)
-            case (_, "<=",  Seq(rhs)) => injectCasts(xt.LessEquals)(lhs, rhs)
+            case (_, "/",   Seq(rhs)) => xt.Division(extractTree(lhs), extractTree(rhs))
+            case (_, ">",   Seq(rhs)) => xt.GreaterThan(extractTree(lhs), extractTree(rhs))
+            case (_, ">=",  Seq(rhs)) => xt.GreaterEquals(extractTree(lhs), extractTree(rhs))
+            case (_, "<",   Seq(rhs)) => xt.LessThan(extractTree(lhs), extractTree(rhs))
+            case (_, "<=",  Seq(rhs)) => xt.LessEquals(extractTree(lhs), extractTree(rhs))
 
-            case (xt.BVType(_), "|",   Seq(rhs)) => injectCasts(xt.BVOr)(lhs, rhs)
-            case (xt.BVType(_), "&",   Seq(rhs)) => injectCasts(xt.BVAnd)(lhs, rhs)
-            case (xt.BVType(_), "^",   Seq(rhs)) => injectCasts(xt.BVXor)(lhs, rhs)
-            case (xt.BVType(_), "<<",  Seq(rhs)) => injectCastsForShift(xt.BVShiftLeft)(lhs, rhs)
-            case (xt.BVType(_), ">>",  Seq(rhs)) => injectCastsForShift(xt.BVAShiftRight)(lhs, rhs)
-            case (xt.BVType(_), ">>>", Seq(rhs)) => injectCastsForShift(xt.BVLShiftRight)(lhs, rhs)
-
-            case (xt.BooleanType, "|", Seq(rhs)) => xt.BoolBitwiseOr(extractTree(lhs), extractTree(rhs))
-            case (xt.BooleanType, "&", Seq(rhs)) => xt.BoolBitwiseAnd(extractTree(lhs), extractTree(rhs))
-            case (xt.BooleanType, "^", Seq(rhs)) => xt.BoolBitwiseXor(extractTree(lhs), extractTree(rhs))
+            case (_, "|",   Seq(rhs)) => xt.BVOr(extractTree(lhs), extractTree(rhs))
+            case (_, "&",   Seq(rhs)) => xt.BVAnd(extractTree(lhs), extractTree(rhs))
+            case (_, "^",   Seq(rhs)) => xt.BVXor(extractTree(lhs), extractTree(rhs))
+            case (_, "<<",  Seq(rhs)) => xt.BVShiftLeft(extractTree(lhs), extractTree(rhs))
+            case (_, ">>",  Seq(rhs)) => xt.BVAShiftRight(extractTree(lhs), extractTree(rhs))
+            case (_, ">>>", Seq(rhs)) => xt.BVLShiftRight(extractTree(lhs), extractTree(rhs))
 
             case (_, "&&",  Seq(rhs)) => xt.And(extractTree(lhs), extractTree(rhs))
             case (_, "||",  Seq(rhs)) => xt.Or(extractTree(lhs), extractTree(rhs))
-
-            case (tpe, "toByte", Seq()) => tpe match {
-              case xt.BVType(8) => extractTree(lhs)
-              case xt.BVType(16 | 32 | 64) => xt.BVNarrowingCast(extractTree(lhs), xt.BVType(8))
-              case tpe => outOfSubsetError(tr, s"Unexpected cast .toByte from $tpe")
-            }
-
-            case (tpe, "toShort", Seq()) => tpe match {
-              case xt.BVType(8) => xt.BVWideningCast(extractTree(lhs), xt.BVType(16))
-              case xt.BVType(16) => extractTree(lhs)
-              case xt.BVType(32 | 64) => xt.BVNarrowingCast(extractTree(lhs), xt.BVType(16))
-              case tpe => outOfSubsetError(tr, s"Unexpected cast .toShort from $tpe")
-            }
-
-            case (tpe, "toInt", Seq()) => tpe match {
-              case xt.BVType(8 | 16) => xt.BVWideningCast(extractTree(lhs), xt.BVType(32))
-              case xt.BVType(32) => extractTree(lhs)
-              case xt.BVType(64) => xt.BVNarrowingCast(extractTree(lhs), xt.BVType(32))
-              case tpe => outOfSubsetError(tr, s"Unexpected cast .toInt from $tpe")
-            }
-
-            case (tpe, "toLong", Seq()) => tpe match {
-              case xt.BVType(8 | 16 | 32 ) => xt.BVWideningCast(extractTree(lhs), xt.BVType(64))
-              case xt.BVType(64) => extractTree(lhs)
-              case tpe => outOfSubsetError(tr, s"Unexpected cast .toLong from $tpe")
-            }
 
             case (tpe, name, args) =>
               outOfSubsetError(tr, "Unknown call to " + name +
@@ -1197,101 +1171,16 @@ trait CodeExtraction extends ASTExtractors {
       case _ => outOfSubsetError(tr, "Could not extract " + tr + " (Scala tree of type "+tr.getClass+")")
     }).setPos(tr.pos)
 
-    /** Inject implicit widening casts according to the Java semantics (5.6.2. Binary Numeric Promotion) */
-    private def injectCasts(ctor: (xt.Expr, xt.Expr) => xt.Expr)
-                           (lhs0: Tree, rhs0: Tree)
-                           (implicit dctx: DefContext): xt.Expr = {
-      injectCastsImpl(ctor)(lhs0, rhs0, false)
-    }
-
-    /**
-     *  Inject casts, special edition for shift operations.
-     *
-     *  NOTE In THEORY, the rhs needs to be promoted independently of lhs.
-     *       In PRACTICE, Inox requires that both operands have the same type.
-     *       [[CodeGeneration]] is applying a narrowing cast from Long to Int
-     *       if needed. Here we add the opposite, and safe operation when lhs
-     *       is a Long. We do not support shift operations when rhs is Long
-     *       but lhs is a smaller BVType.
-     */
-    private def injectCastsForShift(ctor: (xt.Expr, xt.Expr) => xt.Expr)
-                                   (lhs0: Tree, rhs0: Tree)
-                                   (implicit dctx: DefContext): xt.Expr = {
-      injectCastsImpl(ctor)(lhs0, rhs0, true)
-    }
-
-    private def injectCastsImpl(ctor: (xt.Expr, xt.Expr) => xt.Expr)
-                               (lhs0: Tree, rhs0: Tree, shift: Boolean)
-                               (implicit dctx: DefContext): xt.Expr = {
-      def checkBits(tr: Tree, tpe: xt.Type) = tpe match {
-        case xt.BVType(8 | 16 | 32 | 64) => // Byte, Short, Int or Long are ok
-        case xt.BVType(s) => outOfSubsetError(tr, s"Unexpected integer of $s bits")
-        case _ => // non-bitvector types are ok too
-      }
-
-      val lhs = extractTree(lhs0)
-      val rhs = extractTree(rhs0)
-
-      val ltpe = extractType(lhs0)
-      checkBits(lhs0, ltpe)
-      val rtpe = extractType(rhs0)
-      checkBits(rhs0, rtpe)
-
-      def id = { e: xt.Expr => e }
-      def widen32 = { e: xt.Expr => xt.BVWideningCast(e, xt.BVType(32)) }
-      def widen64 = { e: xt.Expr => xt.BVWideningCast(e, xt.BVType(64)) }
-
-      val (lctor, rctor) = (ltpe, rtpe) match {
-        case (xt.BVType(64), xt.BVType(64))          => (id, id)
-        case (xt.BVType(64), xt.BVType(_))           => (id, widen64)
-        case (xt.BVType(_),  xt.BVType(64)) if shift => outOfSubsetError(rhs0, s"Unsupported shift")
-        case (xt.BVType(_),  xt.BVType(64))          => (widen64, id)
-        case (xt.BVType(32), xt.BVType(32))          => (id, id)
-        case (xt.BVType(32), xt.BVType(_))           => (id, widen32)
-        case (xt.BVType(_),  xt.BVType(32))          => (widen32, id)
-        case (xt.BVType(_),  xt.BVType(_))           => (widen32, widen32)
-
-        case (xt.BVType(_), _) | (_, xt.BVType(_)) =>
-          outOfSubsetError(lhs0, s"Unexpected combination of types: $ltpe and $rtpe")
-
-        case (_, _) => (id, id)
-      }
-
-      ctor(lctor(lhs), rctor(rhs))
-    }
-
-    /** Inject implicit widening cast according to the Java semantics (5.6.1. Unary Numeric Promotion) */
-    private def injectCast(ctor: xt.Expr => xt.Expr)(e0: Tree)(implicit dctx: DefContext): xt.Expr = {
-      val e = extractTree(e0)
-      val etpe = extractType(e0)
-
-      val id = { e: xt.Expr => e }
-      val widen32 = { e: xt.Expr => xt.BVWideningCast(e, xt.Int32Type) }
-
-      val ector = etpe match {
-        case xt.BVType(8 | 16) => widen32
-        case xt.BVType(32 | 64) => id
-        case xt.BVType(s) => outOfSubsetError(e0, s"Unexpected integer type of $s bits")
-        case _ => id
-      }
-
-      ctor(ector(e))
-    }
-
     private def extractType(t: Tree)(implicit dctx: DefContext): xt.Type = {
       extractType(t.tpe)(dctx, t.pos)
     }
 
-    private def extractType(tpt: Type)(implicit dctx: DefContext, pos: Position): xt.Type = (tpt match {
-      case CharTpe    => xt.CharType
-      case ByteTpe    => xt.Int8Type
-      case ShortTpe   => xt.Int16Type
-      case IntTpe     => xt.Int32Type
-      case LongTpe    => xt.Int64Type
-      case BooleanTpe => xt.BooleanType
-      case UnitTpe    => xt.UnitType
-      case AnyTpe     => xt.AnyType
-      case NothingTpe => xt.NothingType
+    private def extractType(tpt: Type)(implicit dctx: DefContext, pos: Position): xt.Type = tpt match {
+      case tpe if tpe == CharClass.tpe    => xt.CharType
+      case tpe if tpe == IntClass.tpe     => xt.Int32Type
+      case tpe if tpe == BooleanClass.tpe => xt.BooleanType
+      case tpe if tpe == UnitClass.tpe    => xt.UnitType
+      case tpe if tpe == NothingClass.tpe => xt.Untyped
 
       case ct: ConstantType => extractType(ct.value.tpe)
 
@@ -1312,10 +1201,19 @@ trait CodeExtraction extends ASTExtractors {
         xt.BagType(extractType(btt))
 
       case TypeRef(_, sym, List(ftt,ttt)) if isMapSym(sym) =>
-        xt.MapType(extractType(ftt), xt.ClassType(getIdentifier(optionSymbol), Seq(extractType(ttt))).setPos(pos))
+        xt.MapType(extractType(ftt), xt.ClassType(getIdentifier(optionSymbol), Seq(extractType(ttt))))
 
-      case TypeRef(_, sym, tps) if isTuple(sym, tps.size) =>
-        xt.TupleType(tps map extractType)
+      case TypeRef(_, sym, List(t1,t2)) if isTuple2(sym) =>
+        xt.TupleType(Seq(extractType(t1),extractType(t2)))
+
+      case TypeRef(_, sym, List(t1,t2,t3)) if isTuple3(sym) =>
+        xt.TupleType(Seq(extractType(t1),extractType(t2),extractType(t3)))
+
+      case TypeRef(_, sym, List(t1,t2,t3,t4)) if isTuple4(sym) =>
+        xt.TupleType(Seq(extractType(t1),extractType(t2),extractType(t3),extractType(t4)))
+
+      case TypeRef(_, sym, List(t1,t2,t3,t4,t5)) if isTuple5(sym) =>
+        xt.TupleType(Seq(extractType(t1),extractType(t2),extractType(t3),extractType(t4),extractType(t5)))
 
       case TypeRef(_, sym, btt :: Nil) if isArrayClassSym(sym) =>
         xt.ArrayType(extractType(btt))
@@ -1373,6 +1271,6 @@ trait CodeExtraction extends ASTExtractors {
         } else {
           outOfSubsetError(NoPosition, "Tree with null-pointer as type found")
         }
-    }).setPos(pos)
+    }
   }
 }

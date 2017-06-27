@@ -47,10 +47,6 @@ trait DefaultTactic extends Tactic {
           VCKind.ArrayUsage
         } else if (err.startsWith("Map ")) {
           VCKind.MapUsage
-        } else if (err.endsWith("Overflow")) {
-          VCKind.Overflow
-        } else if (err.startsWith("Shift")) {
-          VCKind.Shift
         } else if (err.startsWith("Division ")) {
           VCKind.DivisionByZero
         } else if (err.startsWith("Modulo ")) {
@@ -63,14 +59,8 @@ trait DefaultTactic extends Tactic {
           VCKind.Assert
         }
 
-      case _: Choose =>
-        VCKind.Choose
-
-      case _: Application =>
+      case Application(_, _) =>
         VCKind.LambdaPre
-
-      case _: ADT =>
-        VCKind.AdtInvariant
 
       case _ =>
         VCKind.Assert
@@ -79,7 +69,7 @@ trait DefaultTactic extends Tactic {
     // We don't collect preconditions here, because these are handled by generatePreconditions
     val calls = transformers.CollectorWithPC(program) {
       case (m @ MatchExpr(scrut, cases), path) =>
-        (m, path implies orJoin(cases map (matchCaseCondition[Path](scrut, _).toClause)))
+        (m, path implies orJoin(cases map (matchCaseCondition(scrut, _).toClause)))
 
       case (e @ Error(_, _), path) =>
         (e, Not(path.toClause))
@@ -89,12 +79,6 @@ trait DefaultTactic extends Tactic {
 
       case (app @ Application(caller, args), path) =>
         (app, path implies Application(Pre(caller), args))
-
-      case (c @ Choose(res, pred), path) if !(res.flags contains Unchecked) =>
-        (c, path implies Not(Forall(Seq(res), Not(pred))))
-
-      case (a @ ADT(tpe, args), path) if tpe.getADT.hasInvariant =>
-        (a, path implies FunctionInvocation(tpe.getADT.invariant.get.id, tpe.tps, Seq(a)))
     }.collect(getFunction(id).fullBody)
 
     calls.map { case (e, correctnessCond) =>

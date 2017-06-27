@@ -6,21 +6,17 @@ package oo
 
 import scala.collection.mutable.{Map => MutableMap}
 
-trait Trees extends holes.Trees with Definitions { self =>
+trait Trees extends holes.Trees { self =>
 
   /* ========================================
-   *              EXPRESSIONS
+   *         EXPRESSIONS AND TYPES
    * ======================================== */
 
   /** $encodingof `receiver.id[tps](args)` */
   case class MethodInvocation(receiver: Expr, id: Identifier, tps: Seq[Type], args: Seq[Expr]) extends Expr with CachingTyped {
     protected def computeType(implicit s: Symbols): Type = receiver.getType match {
-      case ct: ClassType => (s.lookupFunction(id, tps), ct.lookupClass) match {
-        case (Some(tfd), Some(tcd)) =>
-          tfd.fd.flags.collectFirst { case IsMethodOf(cid) => cid }
-            .flatMap(cid => (tcd +: tcd.ancestors).find(_.id == cid))
-            .map(tcd => s.instantiateType(tfd.returnType, tcd.typeMap))
-            .getOrElse(Untyped)
+      case ct: ClassType => (s.lookupFunction(id, tps), s.lookupClass(ct.id)) match {
+        case (Some(tfd), Some(cd)) => s.instantiateType(tfd.returnType, (cd.typeArgs zip ct.tps).toMap)
         case _ => Untyped
       }
       case _ => Untyped
@@ -54,48 +50,23 @@ trait Trees extends holes.Trees with Definitions { self =>
     def getType(implicit s: Symbols): Type = ct
   }
 
-  /** $encodingof `super` */
-  case class Super(ct: ClassType) extends Expr {
-    def getType(implicit s: Symbols): Type = ct
-  }
-
-
-  /* ========================================
-   *              EXPRESSIONS
-   * ======================================== */
-
-  /* Pattern encoding `case binder @ ct(subPatterns...) =>`
-   *
-   * If [[binder]] is empty, consider a wildcard `_` in its place.
-   */
-  case class ClassPattern(binder: Option[ValDef], tpe: ClassType, subPatterns: Seq[Pattern]) extends Pattern
-
-
-  /* ========================================
-   *                 TYPES
-   * ======================================== */
-
-  /** Type associated to instances of [[ClassConstructor]]
-    * 
-    * Note: this class MUST extend `ADTType` in order for `FieldAssignment` to typecheck! */
+  /** Type associated to instances of [[ClassConstructor]] */
   class ClassType(id: Identifier, tps: Seq[Type]) extends ADTType(id, tps) {
     def lookupClass(implicit s: Symbols): Option[TypedClassDef] = s.lookupClass(id, tps)
     def tcd(implicit s: Symbols): TypedClassDef = s.getClass(id, tps)
 
-    override def getField(selector: Identifier)(implicit s: Symbols): Option[ValDef] = {
+    def getField(selector: Identifier)(implicit s: Symbols): Option[ValDef] = {
       def rec(tcd: TypedClassDef): Option[ValDef] =
-        tcd.fields.collectFirst { case vd @ ValDef(`selector`, _, _) => vd }
-          .orElse(tcd.parents.reverse.view.flatMap(rec).headOption)
+        tcd.fields.collectFirst { case vd @ ValDef(`selector`, _, _) => vd }.orElse(tcd.parent.flatMap(rec))
       lookupClass.flatMap(rec)
-    }
-
-    override def copy(id: Identifier = id, tps: Seq[Type] = tps) = new ClassType(id, tps)
-    override def equals(that: Any): Boolean = that match {
-      case ct: ClassType => id == ct.id && tps == ct.tps
-      case _ => false
     }
   }
 
+  /** Companion object of [[ClassType]].
+    *
+    * As [[ClassType]] extends the [[ADTType]] case class, we provide the [[apply]]
+    * and [[unapply]] methods for [[ClassType]] here. 
+    */
   object ClassType {
     def apply(id: Identifier, tps: Seq[Type]): ClassType = new ClassType(id, tps)
     def unapply(tpe: Type): Option[(Identifier, Seq[Type])] = tpe match {
@@ -103,35 +74,6 @@ trait Trees extends holes.Trees with Definitions { self =>
       case _ => None
     }
   }
-
-  /** Top of the typing lattice, corresponds to scala's `Any` type. */
-  case object AnyType extends Type
-
-  /** Bottom of the typing lattice, corresponds to scala's `Nothing` type. */
-  case object NothingType extends Type
-
-  /** $encodingof `tp1 | ... | tpN` */
-  private[oo] case class UnionType(tps: Seq[Type]) extends Type {
-    override def equals(that: Any): Boolean = that match {
-      case ut: UnionType => tps.toSet == ut.tps.toSet
-      case _ => false
-    }
-
-    override def hashCode: Int = tps.toSet.hashCode()
-  }
-
-  /** $encodingof `tp1 & ... & tpN` */
-  private[oo] case class IntersectionType(tps: Seq[Type]) extends Type {
-    override def equals(that: Any): Boolean = that match {
-      case it: IntersectionType => tps.toSet == it.tps.toSet
-      case _ => false
-    }
-
-    override def hashCode: Int = tps.toSet.hashCode()
-  }
-
-  /** $encodingof `_ :> lo <: hi` */
-  case class TypeBounds(lo: Type, hi: Type) extends Type
 
 
   /* ========================================
@@ -146,12 +88,106 @@ trait Trees extends holes.Trees with Definitions { self =>
 
     case _ => super.getDeconstructor(that)
   }
-}
 
 
-trait Printer extends holes.Printer {
-  protected val trees: Trees
-  import trees._
+  /* ========================================
+   *             DEFINITIONS
+   * ======================================== */
+
+  class ClassDef(
+    val id: Identifier,
+    val tparams: Seq[TypeParameterDef],
+    val parent: Option[Identifier],
+    val fields: Seq[ValDef],
+    val methods: Seq[SymbolIdentifier],
+    val flags: Set[Flag]
+  ) extends Definition {
+
+    def root(implicit s: Symbols): ClassDef = parent.map(id => s.getClass(id).root).getOrElse(this)
+
+    def ancestors(implicit s: Symbols): Seq[ClassDef] = parent.map(id => s.getClass(id)) match {
+      case Some(pcd) => pcd +: pcd.ancestors
+      case None => Seq.empty
+    }
+
+    def typeArgs = tparams map (_.tp)
+
+    def typed(tps: Seq[Type])(implicit s: Symbols): TypedClassDef = TypedClassDef(this, tps)
+    def typed(implicit s: Symbols): TypedClassDef = typed(tparams.map(_.tp))
+
+    def copy(
+      id: Identifier = this.id,
+      tparams: Seq[TypeParameterDef] = this.tparams,
+      parent: Option[Identifier] = this.parent,
+      fields: Seq[ValDef] = this.fields,
+      methods: Seq[SymbolIdentifier] = this.methods,
+      flags: Set[Flag] = this.flags
+    ): ClassDef = new ClassDef(id, tparams, parent, fields, methods, flags)
+  }
+
+  case class TypedClassDef(cd: ClassDef, tps: Seq[Type])(implicit val symbols: Symbols) extends Tree {
+    lazy val id: Identifier = cd.id
+    lazy val root: TypedClassDef = cd.root.typed(tps)
+    lazy val ancestors: Seq[TypedClassDef] = cd.ancestors.map(_.typed(tps))
+
+    lazy val parent: Option[TypedClassDef] = cd.parent.map(id => symbols.getClass(id, tps))
+
+    lazy val fields: Seq[ValDef] = {
+      lazy val tmap = (cd.typeArgs zip tps).toMap
+      if (tmap.isEmpty) cd.fields
+      else cd.fields.map(vd => vd.copy(tpe = symbols.instantiateType(vd.tpe, tmap)))
+    }
+
+    def toType = ClassType(id, tps)
+  }
+
+  case class ClassLookupException(id: Identifier) extends LookupException(id, "class")
+
+
+  type Symbols >: Null <: AbstractSymbols
+
+  trait AbstractSymbols extends super.AbstractSymbols with TypeOps { self0: Symbols =>
+    val classes: Map[Identifier, ClassDef]
+
+    private val typedClassCache: MutableMap[(Identifier, Seq[Type]), Option[TypedClassDef]] = MutableMap.empty
+    def lookupClass(id: Identifier): Option[ClassDef] = classes.get(id)
+    def lookupClass(id: Identifier, tps: Seq[Type]): Option[TypedClassDef] =
+      typedClassCache.getOrElseUpdate(id -> tps, lookupClass(id).map(_.typed(tps)))
+
+    def getClass(id: Identifier): ClassDef = lookupClass(id).getOrElse(throw ClassLookupException(id))
+    def getClass(id: Identifier, tps: Seq[Type]): TypedClassDef = lookupClass(id, tps).getOrElse(throw ClassLookupException(id))
+
+    override def asString(implicit opts: PrinterOptions): String = {
+      classes.map(p => prettyPrint(p._2, opts)).mkString("\n\n") +
+        "\n\n-----------\n\n" +
+        super.asString
+    }
+
+    override def transform(t: inox.ast.TreeTransformer { val s: self.type }): t.t.Symbols = t.t match {
+      case tree: Trees =>
+        val tt = t.asInstanceOf[inox.ast.TreeTransformer { val s: self.type; val t: tree.type }]
+        SymbolTransformer(tt).transform(this).asInstanceOf[t.t.Symbols]
+      case _ => super.transform(t)
+    }
+
+    override def equals(that: Any): Boolean = super.equals(that) && (that match {
+      case sym: AbstractSymbols => classes == sym.classes
+      case _ => false
+    })
+
+    override def hashCode: Int = super.hashCode + 31 * classes.hashCode
+
+    def withClasses(classes: Seq[ClassDef]): Symbols
+  }
+
+  case object IsInvariant extends Flag("invariant", Seq.empty)
+  case object IsAbstract extends Flag("abstract", Seq.empty)
+  case object IsMethod extends Flag("method", Seq.empty)
+
+
+  /* ========================================
+   *               PRINTERS
+   * ======================================== */
 
   protected def withSymbols[T <: Tree](elems: Seq[Either[T, Identifier]], header: String)
                                       (implicit ctx: PrinterContext): Unit = {
@@ -179,40 +215,15 @@ trait Printer extends holes.Printer {
       p"${nary(cd.tparams, ", ", "[", "]")}"
       if (cd.fields.nonEmpty) p"(${cd.fields})"
 
-      if (cd.parents.nonEmpty) {
-        p" extends ${nary(cd.parents, " with ")}"
+      cd.parent.foreach { id =>
+        p" extends $id${nary(cd.tparams, ", ", "[", "]")}"
       }
 
-      ctx.opts.symbols.foreach { implicit s =>
-        if (cd.methods.nonEmpty) {
-          p""" {
-              |  ${functions(cd.methods)}
-              |}"""
-        }
+      if (cd.methods.nonEmpty) {
+        p""" {
+            |  ${functions(cd.methods)}
+            |}"""
       }
-
-    case ClassType(id, tps) =>
-      p"${id}${nary(tps, ", ", "[", "]")}"
-
-    case AnyType =>
-      p"Any"
-
-    case NothingType =>
-      p"Nothing"
-
-    case UnionType(tps) =>
-      var first = true
-      for (tp <- tps) {
-        if (!first) p"${" | "}" // weird construction because of stripMargin
-        first = false
-        p"$tp"
-      }
-
-    case IntersectionType(tps) =>
-      p"${nary(tps, " & ")}"
-
-    case TypeBounds(lo, hi) =>
-      p"_ >: $lo <: $hi"
 
     case ClassConstructor(ct, args) =>
       p"$ct($args)"
@@ -229,11 +240,6 @@ trait Printer extends holes.Printer {
 
     case This(_) => p"this"
 
-    case ClassPattern(ob, ct, subs) =>
-      ob foreach (vd => p"${vd.toVariable} @ ")
-      printNameWithPath(ct.id) // no type parameters in patterns
-      p"($subs)"
-
     case (tcd: TypedClassDef) => p"typed class ${tcd.id}[${tcd.tps}]"
 
     case _ => super.ppBody(tree)
@@ -246,6 +252,82 @@ trait Printer extends holes.Printer {
   }
 }
 
+
+trait TypeOps extends ast.TypeOps {
+  protected val trees: Trees
+  import trees._
+
+  override protected def instantiationConstraints(toInst: Type, bound: Type, isUpper: Boolean): Seq[Subtyping] = (toInst, bound) match {
+    case (ct: ClassType, _) if ct.lookupClass.isEmpty => unsolvable
+    case (_, ct: ClassType) if ct.lookupClass.isEmpty => unsolvable
+    case (ct1: ClassType, ct2: ClassType) =>
+      val cd1 = ct1.tcd.cd
+      val cd2 = ct2.tcd.cd
+      val (cl, ch) = if (isUpper) (cd1, cd2) else (cd2, cd1)
+      if (!((cl == ch) || (cl.ancestors contains ch))) unsolvable
+      else {
+        for {
+          (tp, (t1, t2)) <- cd1.typeArgs zip (ct1.tps zip ct2.tps)
+          variance <- if (tp.isCovariant) Seq(isUpper) else if (tp.isContravariant) Seq(!isUpper) else Seq(true, false)
+          constr <- instantiationConstraints(t1, t2, variance)
+        } yield constr
+      }
+
+    case _ => super.instantiationConstraints(toInst, bound, isUpper)
+  }
+
+  override protected def typeBound(tp1: Type, tp2: Type, upper: Boolean): Type = (tp1, tp2) match {
+    case (ct: ClassType, _) if ct.lookupClass.isEmpty => Untyped
+    case (_, ct: ClassType) if ct.lookupClass.isEmpty => Untyped
+    case (ct1: ClassType, ct2: ClassType) =>
+      if (ct1.tps.size != ct2.tps.size) Untyped
+      else {
+        val cd1 = ct1.tcd.cd
+        val cd2 = ct2.tcd.cd
+        val an1 = cd1 +: cd1.ancestors
+        val an2 = cd2 +: cd2.ancestors
+
+        val tps = (cd1.typeArgs zip (ct1.tps zip ct2.tps)).map { case (tp, (t1, t2)) =>
+          if (tp.isCovariant) typeBound(t1, t2, upper)
+          else if (tp.isContravariant) typeBound(t1, t2, !upper)
+          else if (t1 == t2) t1
+          else Untyped
+        }
+
+        val bound = if (upper) {
+          // Upper bound
+          (an1.reverse zip an2.reverse)
+            .takeWhile(((_: ClassDef) == (_: ClassDef)).tupled)
+            .lastOption.map(_._1)
+        } else {
+          // Lower bound
+          if (an1 contains cd2) Some(cd1)
+          else if (an2 contains cd1) Some(cd2)
+          else None
+        }
+
+        bound.map(_.typed(tps).toType).getOrElse(Untyped).unveilUntyped
+      }
+
+    case _ => super.typeBound(tp1, tp2, upper)
+  }
+
+  override protected def unificationConstraints(t1: Type, t2: Type, free: Seq[TypeParameter]): List[(TypeParameter, Type)] = (t1, t2) match {
+    case (ct: ClassType, _) if ct.lookupClass.isEmpty => unsolvable
+    case (_, ct: ClassType) if ct.lookupClass.isEmpty => unsolvable
+    case (ct1: ClassType, ct2: ClassType) if ct1.tcd.cd == ct2.tcd.cd =>
+      (ct1.tps zip ct2.tps).toList flatMap (p => unificationConstraints(p._1, p._2, free))
+    case _ => super.unificationConstraints(t1, t2, free)
+  }
+
+  override protected def unificationSolution(const: List[(Type, Type)]): List[(TypeParameter, Type)] = const match {
+    case (ct: ClassType, _) :: tl if ct.lookupClass.isEmpty => unsolvable
+    case (_, ct: ClassType) :: tl if ct.lookupClass.isEmpty => unsolvable
+    case (ct1: ClassType, ct2: ClassType) :: tl if ct1.tcd.cd == ct2.tcd.cd =>
+      unificationSolution((ct1.tps zip ct2.tps).toList ++ tl)
+    case _ => super.unificationSolution(const)
+  }
+}
 
 trait TreeDeconstructor extends holes.TreeDeconstructor {
   protected val s: Trees
@@ -267,46 +349,17 @@ trait TreeDeconstructor extends holes.TreeDeconstructor {
     case _ => super.deconstruct(e)
   }
 
-  override def deconstruct(pattern: s.Pattern): (Seq[s.Variable], Seq[s.Expr], Seq[s.Type], Seq[s.Pattern], (Seq[t.Variable], Seq[t.Expr], Seq[t.Type], Seq[t.Pattern]) => t.Pattern) = pattern match {
-    case s.ClassPattern(binder, ct, subs) =>
-      (binder.map(_.toVariable).toSeq, Seq(), Seq(ct), subs, (vs, _, tps, subs) => {
-        t.ClassPattern(vs.headOption.map(_.toVal), tps.head.asInstanceOf[t.ClassType], subs)
-      })
-
-    case _ => super.deconstruct(pattern)
-  }
-
   override def deconstruct(tpe: s.Type): (Seq[s.Type], Seq[s.Flag], (Seq[t.Type], Seq[t.Flag]) => t.Type) = tpe match {
     case s.ClassType(id, tps) => (tps, Seq(), (tps, _) => t.ClassType(id, tps))
-    case s.AnyType => (Seq(), Seq(), (_, _) => t.AnyType)
-    case s.NothingType => (Seq(), Seq(), (_, _) => t.NothingType)
-    case s.UnionType(tps) => (tps, Seq(), (tps, _) => t.UnionType(tps))
-    case s.IntersectionType(tps) => (tps, Seq(), (tps, _) => t.IntersectionType(tps))
-    case s.TypeBounds(lo, hi) => (Seq(lo, hi), Seq(), (tps, _) => t.TypeBounds(tps(0), tps(1)))
     case _ => super.deconstruct(tpe)
   }
 
   override def deconstruct(f: s.Flag): (Seq[s.Expr], Seq[s.Type], (Seq[t.Expr], Seq[t.Type]) => t.Flag) = f match {
     case s.IsInvariant => (Seq(), Seq(), (_, _) => t.IsInvariant)
     case s.IsAbstract => (Seq(), Seq() ,(_, _) => t.IsAbstract)
-    case s.IsSealed => (Seq(), Seq(), (_, _) => t.IsSealed)
-    case s.IsMethodOf(id) => (Seq(), Seq(), (_, _) => t.IsMethodOf(id))
-    case s.Bounds(lo, hi) => (Seq(), Seq(lo, hi), (_, tps) => t.Bounds(tps(0), tps(1)))
+    case s.IsMethod => (Seq(), Seq(), (_, _) => t.IsMethod)
     case _ => super.deconstruct(f)
   }
-}
-
-trait TreeTransformer extends ast.TreeTransformer {
-  val s: Trees
-  val t: Trees
-
-  def transform(cd: s.ClassDef): t.ClassDef = new t.ClassDef(
-    cd.id,
-    cd.tparams.map(tdef => transform(tdef)),
-    cd.parents.map(ct => transform(ct).asInstanceOf[t.ClassType]),
-    cd.fields.map(vd => transform(vd)),
-    cd.flags.map(f => transform(f))
-  ).copiedFrom(cd)
 }
 
 trait SimpleSymbolTransformer extends inox.ast.SimpleSymbolTransformer {
@@ -332,9 +385,10 @@ object SymbolTransformer {
     protected def transformClass(cd: s.ClassDef): t.ClassDef = new t.ClassDef(
       cd.id,
       cd.tparams.map(tdef => trans.transform(tdef)),
-      cd.parents.map(ct => trans.transform(ct).asInstanceOf[t.ClassType]),
+      cd.parent,
       cd.fields.map(vd => trans.transform(vd)),
+      cd.methods,
       cd.flags.map(f => trans.transform(f))
-    ).copiedFrom(cd)
+    )
   }
 }

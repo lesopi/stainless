@@ -2,8 +2,6 @@
 
 package object stainless {
 
-  object DebugSectionExtraction extends inox.DebugSection("extraction")
-
   type Program = inox.Program { val trees: ast.Trees }
 
   type StainlessProgram = Program { val trees: stainless.trees.type }
@@ -12,20 +10,11 @@ package object stainless {
   type Identifier = inox.Identifier
   val FreshIdentifier = inox.FreshIdentifier
 
-  implicit class IdentifierFromSymbol(id: Identifier) {
-    def fullName: String = id match {
-      case ast.SymbolIdentifier(name) => name
-      case _ => id.name
-    }
-  }
-
   object trees extends ast.Trees with inox.ast.SimpleSymbols {
     case class Symbols(
       functions: Map[Identifier, FunDef],
       adts: Map[Identifier, ADTDefinition]
     ) extends SimpleSymbols with AbstractSymbols
-
-    object printer extends ast.Printer { val trees: stainless.trees.type = stainless.trees }
   }
 
   implicit lazy val stainlessSemantics: inox.SemanticsProvider { val trees: stainless.trees.type } = new inox.SemanticsProvider {

@@ -2,8 +2,6 @@
 
 package stainless
 
-import scala.language.existentials
-
 /** Provides definitions for a hierarchy of languages above stainless,
   * topped by xlang, which is the extended input language of stainless.
   *
@@ -40,9 +38,6 @@ package object extraction {
     } with ExprOps
   }
 
-  /** Unifies all stainless tree printers */
-  trait Printer extends ast.Printer with termination.Printer
-
   /** Unifies all stainless tree extractors */
   trait TreeDeconstructor extends ast.TreeDeconstructor with termination.TreeDeconstructor
 
@@ -54,26 +49,23 @@ package object extraction {
       functions: Map[Identifier, FunDef],
       adts: Map[Identifier, ADTDefinition]
     ) extends SimpleSymbols with AbstractSymbols
-
-    object printer extends Printer { val trees: extraction.trees.type = extraction.trees }
   }
 
   case class MissformedStainlessCode(val tree: inox.ast.Trees#Tree, msg: String)
     extends Exception(msg)
 
-  def extract(program: Program { val trees: xlang.trees.type }): Program { val trees: extraction.trees.type } = {
-    val pipeline =
-      xlang.extractor      andThen
+  object preconditionInferrence extends {
+    val trees: extraction.trees.type = extraction.trees
+  } with PreconditionInference
+
+  val extractor: inox.ast.SymbolTransformer {
+    val s: xlang.trees.type
+    val t: trees.type
+  } = xlang.extractor      andThen
       oo.extractor         andThen
       holes.extractor      andThen
       imperative.extractor andThen
       innerfuns.extractor  andThen
-      inlining.extractor
-
-    val extracted: Program { val trees: extraction.trees.type } =
-      program.transform(pipeline)
-
-    new PreconditionInference(extracted).targetProgram
-  }
-
+      inlining.extractor   andThen
+      preconditionInferrence
 }

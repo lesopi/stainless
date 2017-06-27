@@ -25,15 +25,11 @@ object VCKind {
   case object ExhaustiveMatch extends VCKind("match exhaustiveness", "match.")
   case object ArrayUsage      extends VCKind("array usage", "arr. use")
   case object MapUsage        extends VCKind("map usage", "map use")
-  case object Overflow        extends VCKind("integer overflow", "overflow")
-  case object Shift           extends VCKind("strict arithmetic on shift", "shift")
   case object DivisionByZero  extends VCKind("division by zero", "div 0")
   case object ModuloByZero    extends VCKind("modulo by zero", "mod 0")
   case object RemainderByZero extends VCKind("remainder by zero", "rem 0")
   case object CastError       extends VCKind("cast correctness", "cast")
-  case object PostTactic      extends VCKind("postcondition tactic", "tact.")
-  case object Choose          extends VCKind("choose satisfiability", "choose")
-  case object AdtInvariant    extends VCKind("adt invariant", "adt inv.")
+  case object PostTactic      extends VCKind("postcondition tactic", "tact")
 }
 
 sealed abstract class VCStatus[+Model](val name: String) {
