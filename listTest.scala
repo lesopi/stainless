@@ -578,9 +578,16 @@ object ListClass1{
     /* Range from start (inclusive) to until (exclusive) */
     @library
     def range(start: BigInt, until: BigInt): List[BigInt] = {
-      require(start <= until)
+      //require(start <= until)
       if(until <= start) Nil[BigInt]() else Cons(start, range(start + 1, until))
-    } ensuring{(res: List[BigInt]) => res.size == until - start }
+    } //ensuring{(res: List[BigInt]) => res.size == until - start }
+
+    /* Range from start (inclusive) to until (exclusive) */
+    /*@library
+    def range(start: Int, until: Int): List[Int] = {
+      require(start <= until)
+      if(until <= start) Nil[Int]() else Cons(start, range(start + 1, until))
+    } ensuring{(res: List[Int]) => res.size == until - start }*/
 
     @library
     def mkString[A](l: List[A], mid: String, f: A => String) = {
@@ -594,6 +601,16 @@ object ListClass1{
       }
     }
 
+    def computeFactorial(num : Int) : List[Int] = {
+        if (num < 1)
+           Cons(1, Nil[Int]())
+        else
+           Cons(num, Nil[Int]());
+    }
+
+    def call(): List[Int] = {
+      computeFactorial(10)
+    }
 
   @library
   object ListOps {
@@ -915,7 +932,7 @@ object ListClass1{
       }
     )
 
-    /** A way to apply the forall axiom */
+     // A way to apply the forall axiom
     def applyForAll[T](l: List[T], i: BigInt, p: T => Boolean): Boolean = {
       require(i >= 0 && i < l.length && l.forall(p))
       p(l(i))
@@ -1473,7 +1490,7 @@ object ListClass2{
   }
 
   @isabelle.constructor(name = "List.list.Cons")
-  case class Cons[T](u: T, t: List[T]) extends List[T]
+  case class Cons[T](h: T, t: List[T]) extends List[T]
 
   @isabelle.constructor(name = "List.list.Nil")
   case class Nil[T]() extends List[T]
@@ -1490,18 +1507,18 @@ object ListClass2{
 
     @library
     def fill[T](n: BigInt)(x: T) : List[T] = {
-      /*if (n <= 0) Nil[T]()
-      else Cons[T](x, fill[T](n-1)(x))*/
-      Nil[T]()
+      if (n <= 0) Nil[T]()
+      else Cons[T](x, fill[T](n-1)(x))
+      //Nil[T]()
     } ensuring(res => (res.content == (if (n <= BigInt(0)) Set.empty[T] else Set(x))) &&
                       res.size == (if (n <= BigInt(0)) BigInt(0) else n))
 
     /* Range from start (inclusive) to until (exclusive) */
     @library
-    def range(start: BigInt, until: BigInt): List[BigInt] = {
-      require(start <= until)
-      if(until <= start) Nil[BigInt]() else Cons(start, range(start/* + 1*/, until))
-    } ensuring{(res: List[BigInt]) => res.size == until - start }
+    def range(start: Int, until: Int): List[Int] = {
+      //require(start <= until)
+      if(until <= start) Nil[Int]() else Cons(start, range(start + 1, until))
+    } //ensuring{(res: List[Int]) => res.size == until - start }
 
     @library
     def mkString[A](l: List[A], mid: String, f: A => String) = {
@@ -1510,10 +1527,21 @@ object ListClass2{
         case Cons(a, b) => mid + f(a) + rec(b)
       }
       l match {
-        case Nil() => /*""*/ "Nothing"
-        case Cons(a, b) => /*f(a) +*/ rec(b)
+        case Nil() => "" // "Nothing"
+        case Cons(a, b) => f(a) + rec(b)
       }
 
+  }
+
+  def computeFact(num : Int) : List[Int] = {
+      if (num < 1)
+         Cons(1, Nil[Int]())
+      else
+         Cons(num , Nil[Int]());
+  }
+
+  def call(): List[Int] = {
+    range(0, 10)
   }
 
   @library
@@ -1836,7 +1864,7 @@ object ListClass2{
       }
     )
 
-    /** A way to apply the forall axiom */
+    //A way to apply the forall axiom
     def applyForAll[T](l: List[T], i: BigInt, p: T => Boolean): Boolean = {
       require(i >= 0 && i < l.length && l.forall(p))
       p(l(i))
