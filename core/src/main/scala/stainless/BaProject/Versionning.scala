@@ -292,7 +292,7 @@ object Versionning extends Component {
     * Finds what if the transformer that corresponds to
     * the transformation between the two expressions
     */
-    def compare(e1: Expr, e2: Expr, mapping: List[(Option[FunDef], Option[FunDef])] = Nil): ExprTransformer = {
+    def compare(e1: Expr, e2: Expr, mapping: List[(Option[FunDef], Option[FunDef])] = Nil, print: Boolean = false): ExprTransformer = {
 
       def composition(l: List[ExprTransformer]): ExprTransformer = {
         if (l.size == 0) NoOp
@@ -301,6 +301,7 @@ object Versionning extends Component {
       }
 
       def findTransformer(ex1: Expr, ex2: Expr, path: List[Int] = Nil): ExprTransformer = {
+
         val Operator(c1, f1) = ex1
         val Operator(c2, f2) = ex2
 
@@ -315,7 +316,16 @@ object Versionning extends Component {
               }
 
             }
-
+            case (Variable(id1, tpe1, fl1), Variable(id2, tpe2, fl2))  =>{
+              if(print){ if(id1.name == id2.name)
+                println("same name")
+              else{
+                println("name1: " + id1.name )
+                println("name2: " + id2.name )
+              }}
+              //if(print){ println("NoOperations :D")}
+              NoOp
+            }
             case _ if(ex1.getClass != ex2.getClass) =>
             if(c1 == c2) ChangeExpr(ex2, path)  else Substitute(ex1, ex2)
 
@@ -326,7 +336,8 @@ object Versionning extends Component {
               if(zp.isEmpty) {
                 path match {
                   case Nil => Substitute(ex1, ex2)
-                  case _ => Replace(ex2, path)}
+                  case _ => {if(print) {println(ex1.getClass); println(ex2.getClass)}
+                    Replace(ex2, path)}}
               } else {
                 for((ch1, ch2) <- zp){
                   if(ch1 != ch2) {
@@ -551,6 +562,7 @@ object Versionning extends Component {
       }
 
       def comparison(preFun: FunDef, postFun: FunDef): Transformer = {
+
         val bodyTrf = compare(preFun.fullBody, postFun.fullBody)
         if (signature(preFun, postFun) && bodyTrf == NoOp)
           NoOperation
@@ -563,6 +575,15 @@ object Versionning extends Component {
           getSignatureTransformer(preFun, postFun))
 
       }
+      def tostr(fun1: FunDef, fun2: FunDef): Boolean = {
+        val eq = fun1.id.name == fun2.id.name
+        if(eq){
+          println(fun1.id.name)
+        }
+        eq
+      }
+
+
       println(source.length)
       val modifiedS = source.filterNot(s => target.exists(
         (t: FunDef) => signature(s, t) && compare(s.fullBody, t.fullBody) == NoOp))
@@ -573,17 +594,9 @@ object Versionning extends Component {
       val h = new Hungarian[FunDef](modifiedS, modifiedT)
       ctx.reporter.info("H")
       println(modifiedS.length)
-      val maps = h.solve((prf: FunDef, pof: FunDef) => getWeight(comparison(prf, pof)), false)
+      val maps = h.solve((prf: FunDef, pof: FunDef) => getWeight(comparison(prf, pof)), false, (prf: FunDef, pof: FunDef) => tostr(prf, pof))
       println(maps.length)
       ctx.reporter.info(maps.map(f => (f._1.id.name, f._2.id.name)))
-      // println("before getBest")
-      // val mapping = getMapping(modifiedS, modifiedT)
-      // println("mapping")
-      // val compos = mapping.map(composition(_))
-      // println("composition")
-      // val best = getBest(compos, NoOp)
-      // println("after getBest")
-      // transformerToString(best)
       NoOperation
 
     }

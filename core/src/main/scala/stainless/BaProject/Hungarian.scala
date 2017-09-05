@@ -63,7 +63,6 @@ class Hungarian[T](source: List[T], target: List[T]){
   */
   private def reductionPhase(costs: List[List[Int]]): List[List[Int]] = {
     // substract minimum from rows
-    display(costs)
     val rowSub = costs.map(row => {
       val mini = row.min
       row.map(c => c - mini)
@@ -76,8 +75,6 @@ class Hungarian[T](source: List[T], target: List[T]){
 
     // substract minimum from columns
     val colSub = rowSub.map(row => row.zip(minCol).map(tup => tup._1 - tup._2))
-
-    display(colSub)
     colSub
   }
 
@@ -86,16 +83,7 @@ class Hungarian[T](source: List[T], target: List[T]){
   * number of lines that can cover all the zeros.
   */
 
-  /*
-  FIX BUG:IF THERE ARE >1 ZERO LEFT IN EVERY COLUMN/ROW, CHECK IN THE ONES
-  WITH MINIMUM ZEROS (USE ITERATOR: 2, 3, 4...) AND TAKE THE FIRST ONE.
-  CHECK IF UNCROSSED WAS CHANGED (USE LENGTH), IF NOT OMCREMENT ITERATOR.
-
-  FOR NOW: LOOPING BECAUSE OF SQUARES OF ZEROS
-  */
-
   private def covering(costs: List[List[Int]]): (List[(Int, Int)], List[Int], List[Int], List[(Int, Int)]) = {
-    // println("covering")
     val indexes = (0 to costs.length - 1).toList
 
     val tmp = costs.map(row => row.zipWithIndex.filter(_._1 == 0).map(_._2))
@@ -107,9 +95,6 @@ class Hungarian[T](source: List[T], target: List[T]){
     var uncrossed = zeroOccurences
     var nbzeros = 1
     var crossed = List[(Int, Int)]()
-    // println("zeroOccurences")
-    // println(zeroOccurences)
-    // println(zeroOccurences.length)
 
     while(uncrossed.length > 0){
       val size = uncrossed.length
@@ -128,24 +113,8 @@ class Hungarian[T](source: List[T], target: List[T]){
               if(z != s) crossed = z :: crossed
             }
           }
-          //uncrossed = uncrossed.filterNot(_._2 == s._2)
-          //uncrossed = uncrossed.filterNot(_._1 == s._1)
         }
       }
-
-      // column scanning
-      /*for(i <- indexes){
-        val ua = uncrossed.filter(_._2 == i)
-
-        if(ua.length == nbzeros){
-          val s = ua(0)
-          squares = s :: squares
-          rowLines = (rowLines ++ List(s._1)).distinct
-          colLines = (colLines ++ List(s._2)).distinct
-          uncrossed = uncrossed.filterNot(u => u._1 == s._1)
-          uncrossed = uncrossed.filterNot(_._2 == s._2)
-        }
-      }*/
       if(uncrossed.length == size){
         nbzeros += 1
       } else {
@@ -160,8 +129,6 @@ class Hungarian[T](source: List[T], target: List[T]){
   * Determines whether the solution to the problem is complete or not
   */
   private def complete(squares: List[(Int, Int)], matLength: Int): Boolean = {
-    //val indexes = (0 to matLength - 1).toList
-    // println("complete: " + squares)
     for(i <- (0 to matLength - 1)){
       val row = squares.find(_._1 == i)
       val col = squares.find(_._2 == i)
@@ -171,9 +138,7 @@ class Hungarian[T](source: List[T], target: List[T]){
       }
 
     }
-    // println("true")
     true
-    //squares.length == math.max(source.length, target.length)
   }
 
   /*
@@ -186,33 +151,20 @@ class Hungarian[T](source: List[T], target: List[T]){
     var same = false
     var marquedRow = indexes.filterNot(squares.map(_._1).toSet)
     var marquedCol = List[Int]()
-    //println(squares)
-    //println(crossed)
-    // println("intersection: ")
-    // println(crossed.filter(squares.contains(_)))
-    // println("marqued rows: " + marquedRow)
 
     while (!same){
       var sizeR = marquedRow.length
       var sizeC = marquedCol.length
       marquedCol = (marquedCol ::: crossed.filter(c => marquedRow.contains(c._1)).map(_._2).distinct).distinct
-      // println("marqued columns: " + marquedCol)
       marquedRow = (marquedRow ::: squares.filter(s => marquedCol.contains(s._2)).map(_._1).distinct).distinct
-      // println("marqued rows 2: " + marquedRow)
       same = (sizeR == marquedRow.length && sizeC == marquedCol.length)
     }
 
     val unlinedRows = marquedRow
     val unlinedCols = indexes.filterNot(marquedCol.toSet)
 
-    // println("uncrossedRows: " + unlinedRows)
-    // println("uncrossedCols: " + unlinedCols)
-
     val zero = costs.zipWithIndex.map(ri => ri._1.zipWithIndex.filter(_._1 == 0).map(cj =>(ri._2, cj._2))).flatten
-    // println("zero: " + zero.length)
-    // println(zero)
     val mini = unlinedRows.map(r => (unlinedCols.map(c => costs.apply(r).apply(c)))).flatten.min
-    // println("mini: " + mini.toString)
     val newCosts = costs.zipWithIndex.map(row => {
       if (unlinedRows.contains(row._2)){
         row._1.zipWithIndex.map(col => {
@@ -228,7 +180,6 @@ class Hungarian[T](source: List[T], target: List[T]){
 
       })
     })
-    // println("update Costs")
     newCosts
   }
 
@@ -239,13 +190,9 @@ class Hungarian[T](source: List[T], target: List[T]){
   *   otherwise reduce the cost matrix and repeat
   */
   private def optimizationPhase(costs: List[List[Int]]): List[(Int, Int)] = {
-    // println("optimization")
     val (squares, rows, cols, crossed) = covering(costs)
     if(!complete(squares, costs.length)) {
-      // println("not complete")
-      //display(costs)
       val newCosts = updateCosts(costs, rows, cols, squares, crossed)
-      //display(newCosts)
       optimizationPhase(newCosts)
     } else squares
   }
@@ -255,9 +202,7 @@ class Hungarian[T](source: List[T], target: List[T]){
   */
   private def findSolution(costs: List[List[Int]]): List[(T, T)] = {
     val redMatrix = reductionPhase(costs)
-    println("Reduction done")
     val positionSolution = optimizationPhase(redMatrix)
-    println("optimization done")
     positionSolution.map(rc => (source.apply(rc._1), target.apply(rc._2)))
   }
 
@@ -277,25 +222,20 @@ class Hungarian[T](source: List[T], target: List[T]){
   */
   def solve(costs: List[List[Int]], findMax: Boolean): List[(T, T)] = {
 
-    val costMat = if(findMax) costs else transformMaxIntoMin(costs)
+    val costMat = if(findMax) transformMaxIntoMin(costs) else costs
     val finalCostMatrix = balance(costMat)
     findSolution(finalCostMatrix)
   }
+
+
 
   /*
   * Finds the solution to the assignment problem given a function
   * computing costs
   */
-  def solve(fun: (T, T) => Int, findMax: Boolean): List[(T, T)] = {
+  def solve(fun: (T, T) => Int, findMax: Boolean, tostr: (T, T) => Boolean): List[(T, T)] = {
     // create the cost matrix from source, target and function
-    println("creating cost matrix")
-    val costsMatrix = source.map(s => target.map(t => {
-      println("source target: " + s.toString + " " + t.toString)
-      val weight = fun(s, t)
-      println("weight: " + weight)
-      weight
-    }))
-    println("cost matrix done")
+    val costsMatrix = source.map(s => target.map(t => fun(s, t)))
     solve(costsMatrix, findMax)
   }
 }
